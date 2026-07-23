@@ -1,0 +1,60 @@
+[
+  {
+    "SiteCode": "BLN001",
+    "SiteName": "Example Nodes Site",
+    "DeviceCode": "DEV000",
+    "InstallationCode": "COMM000",
+    "Latitude": 51.5,
+    "Longitude": -0.12,
+    "Borough": "Camden",
+    "SiteClassification": "Urban Background",
+    "SiteLocationType": "Outdoor",
+    "SensorHeightAboveGround": 2.5,
+    "DistanceToKerb": 8,
+    "SiteDescription": "Example fixture site",
+    "SitePhotoURL": "https://example.org/site.jpg",
+    "StartDate": "2025-01-01T00:00:00Z",
+    "EndDate": "2025-12-31T23:59:59Z",
+    "Facility": "School",
+    "SponsorName": "Example Old Sponsor",
+    "PowerTag": "Battery",
+    "SensorContract": "Example Old Contract",
+    "Location": {
+      "geometry": {
+        "coordinates": [
+          51.5,
+          -0.12
+        ]
+      }
+    }
+  },
+  {
+    "SiteCode": "BLN001",
+    "SiteName": "Example Nodes Site",
+    "DeviceCode": "DEV001",
+    "InstallationCode": "COMM001",
+    "Latitude": 51.5,
+    "Longitude": -0.12,
+    "Borough": "Camden",
+    "SiteClassification": "Urban Background",
+    "SiteLocationType": "Outdoor",
+    "SensorHeightAboveGround": 2.5,
+    "DistanceToKerb": 8,
+    "SiteDescription": "Example fixture site",
+    "SitePhotoURL": "https://example.org/site.jpg",
+    "StartDate": "2026-01-01T00:00:00Z",
+    "EndDate": null,
+    "Facility": "School",
+    "SponsorName": "Example Sponsor",
+    "PowerTag": "Mains",
+    "SensorContract": "Example Contract",
+    "Location": {
+      "geometry": {
+        "coordinates": [
+          51.5,
+          -0.12
+        ]
+      }
+    }
+  }
+]

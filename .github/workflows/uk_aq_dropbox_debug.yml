@@ -1,0 +1,144 @@
+name: UK-AQ Dropbox Debug
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug-dropbox:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install requests
+
+      - name: Debug Dropbox access
+        env:
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          DROPBOX_TEST_PATH: ${{ secrets.DROPBOX_TEST_PATH }}
+          PCON_GEOJSON_DROPBOX_BASE: ${{ secrets.PCON_GEOJSON_DROPBOX_BASE }}
+          PCON_GEOJSON_DROPBOX_PATH: ${{ secrets.PCON_GEOJSON_DROPBOX_PATH }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+          import requests
+
+          app_key = os.environ.get("DROPBOX_APP_KEY")
+          app_secret = os.environ.get("DROPBOX_APP_SECRET")
+          refresh_token = os.environ.get("DROPBOX_REFRESH_TOKEN")
+          raw_path = (
+              os.environ.get("DROPBOX_TEST_PATH")
+              or os.environ.get("PCON_GEOJSON_DROPBOX_BASE")
+              or os.environ.get("PCON_GEOJSON_DROPBOX_PATH")
+          )
+
+          if not all([app_key, app_secret, refresh_token, raw_path]):
+              print("Missing Dropbox credentials or test path.", file=sys.stderr)
+              sys.exit(1)
+
+          token_resp = requests.post(
+              "https://api.dropbox.com/oauth2/token",
+              data={
+                  "grant_type": "refresh_token",
+                  "refresh_token": refresh_token,
+                  "client_id": app_key,
+                  "client_secret": app_secret,
+              },
+              timeout=30,
+          )
+          token_resp.raise_for_status()
+          access_token = token_resp.json()["access_token"]
+
+          def dropbox_request(endpoint, payload=None):
+              resp = requests.post(
+                  f"https://api.dropboxapi.com/2/{endpoint}",
+                  headers={"Authorization": f"Bearer {access_token}"},
+                  json=payload,
+                  timeout=30,
+              )
+              try:
+                  resp.raise_for_status()
+              except requests.HTTPError:
+                  print(
+                      f"Dropbox API error for {endpoint} (status {resp.status_code}): {resp.text}",
+                      file=sys.stderr,
+                  )
+                  raise
+              if resp.content:
+                  return resp.json()
+              return {}
+
+          account_info = dropbox_request("users/get_current_account")
+          root_info = account_info.get("root_info", {})
+          root_tag = root_info.get(".tag")
+          app_folder_name = root_info.get("app_folder_name")
+          account_email = account_info.get("email")
+          account_id = account_info.get("account_id")
+          print(f"Dropbox account: {account_email} ({account_id})")
+          print(f"Dropbox root_info: {root_info}")
+
+          def normalize_path(path):
+              cleaned = path.strip()
+              if cleaned in ("", "/"):
+                  return ""
+              if not cleaned.startswith("/"):
+                  cleaned = f"/{cleaned}"
+              if root_tag == "app_folder" and cleaned.startswith("/Apps/"):
+                  parts = cleaned.split("/", 3)
+                  if len(parts) >= 4 and (not app_folder_name or parts[2] == app_folder_name):
+                      cleaned = f"/{parts[3]}"
+              return cleaned
+
+          print(f"Raw test path: {raw_path}")
+          normalized_path = normalize_path(raw_path)
+          print(f"Normalized test path: {normalized_path}")
+          if root_tag == "app_folder":
+              print("Note: Dropbox app folder access is enabled.")
+              print(
+                  "If your path starts with /Apps/<app-name>/..., it must be "
+                  "converted to an app-root path like /Geo-Resources/..."
+              )
+
+          def list_folder(path, label):
+              print(f"Listing {label}: {path or '/'}")
+              listing = dropbox_request("files/list_folder", {"path": path})
+              entries = listing.get("entries", [])
+              print(f"Found {len(entries)} entries under {path or '/'}")
+              for entry in entries:
+                  print(f"- {entry.get('name')} ({entry.get('.tag')})")
+              return entries
+
+          if normalized_path.lower().endswith(".geojson"):
+              meta = dropbox_request("files/get_metadata", {"path": normalized_path})
+              print("Metadata:", meta)
+          else:
+              try:
+                  list_folder(normalized_path, "target path")
+              except requests.HTTPError:
+                  parent = "/".join(normalized_path.rstrip("/").split("/")[:-1])
+                  if parent:
+                      print("Target path failed. Trying parent folder for context...")
+                      try:
+                          list_folder(parent, "parent path")
+                      except requests.HTTPError:
+                          print("Parent folder lookup failed.", file=sys.stderr)
+                  else:
+                      print("No parent folder to inspect.", file=sys.stderr)
+                  print("Also listing app root for reference...")
+                  try:
+                      list_folder("", "app root")
+                  except requests.HTTPError:
+                      print("App root listing failed.", file=sys.stderr)
+                  raise
+          PY

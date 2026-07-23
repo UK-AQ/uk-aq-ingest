@@ -1,0 +1,144 @@
+name: Validate GitHub Env Targets
+
+on:
+  push:
+    paths:
+      - ".github/workflows/*.yml"
+      - "scripts/uk_aq_sync_github_secrets.sh"
+      - "config/uk_aq_github_env_targets.csv"
+  pull_request:
+    paths:
+      - ".github/workflows/*.yml"
+      - "scripts/uk_aq_sync_github_secrets.sh"
+      - "config/uk_aq_github_env_targets.csv"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate env target map against workflows
+        run: |
+          python3 - <<'PY'
+          import csv
+          import re
+          import sys
+          from pathlib import Path
+
+          map_path = Path("config/uk_aq_github_env_targets.csv")
+          workflows_dir = Path(".github/workflows")
+          allowed_targets = {"secret", "variable", "both", "local"}
+          key_re = re.compile(r"^[A-Z0-9_]+$")
+
+          if not map_path.exists():
+              print(f"Missing mapping file: {map_path}", file=sys.stderr)
+              sys.exit(1)
+
+          mapping = {}
+          with map_path.open("r", encoding="utf-8", newline="") as handle:
+              reader = csv.DictReader(handle)
+              if not reader.fieldnames:
+                  print(f"Mapping file is empty: {map_path}", file=sys.stderr)
+                  sys.exit(1)
+              normalized = {name.strip().lower(): name for name in reader.fieldnames}
+              if "key" not in normalized or "target" not in normalized:
+                  print(
+                      "Mapping file must contain 'key' and 'target' columns.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+              key_col = normalized["key"]
+              target_col = normalized["target"]
+
+              for idx, row in enumerate(reader, start=2):
+                  key = (row.get(key_col) or "").strip()
+                  target = (row.get(target_col) or "").strip().lower()
+                  if not key:
+                      continue
+                  if not key_re.match(key):
+                      print(
+                          f"Invalid key '{key}' at {map_path}:{idx}. Use uppercase [A-Z0-9_].",
+                          file=sys.stderr,
+                      )
+                      sys.exit(1)
+                  if target not in allowed_targets:
+                      print(
+                          f"Invalid target '{target}' for key '{key}' at {map_path}:{idx}.",
+                          f"Allowed targets: {', '.join(sorted(allowed_targets))}.",
+                          file=sys.stderr,
+                      )
+                      sys.exit(1)
+                  prev = mapping.get(key)
+                  if prev and prev != target:
+                      print(
+                          f"Conflicting targets for key '{key}' in {map_path}: {prev} vs {target}.",
+                          file=sys.stderr,
+                      )
+                      sys.exit(1)
+                  mapping[key] = target
+
+          var_refs = {}
+          secret_refs = {}
+          var_pat = re.compile(r"\bvars\.([A-Z0-9_]+)\b")
+          secret_pat = re.compile(r"\bsecrets\.([A-Z0-9_]+)\b")
+
+          for wf in sorted(workflows_dir.glob("*.yml")):
+              text = wf.read_text(encoding="utf-8")
+              for key in var_pat.findall(text):
+                  var_refs.setdefault(key, set()).add(str(wf))
+              for key in secret_pat.findall(text):
+                  secret_refs.setdefault(key, set()).add(str(wf))
+
+          all_ref_keys = sorted(set(var_refs) | set(secret_refs))
+          missing = []
+          mismatches = []
+
+          for key in all_ref_keys:
+              expected = (
+                  "both"
+                  if key in var_refs and key in secret_refs
+                  else ("variable" if key in var_refs else "secret")
+              )
+              actual = mapping.get(key)
+              if actual is None:
+                  refs = sorted(var_refs.get(key, set()) | secret_refs.get(key, set()))
+                  missing.append((key, expected, refs))
+                  continue
+              if actual != expected:
+                  refs = sorted(var_refs.get(key, set()) | secret_refs.get(key, set()))
+                  mismatches.append((key, expected, actual, refs))
+
+          if missing or mismatches:
+              if missing:
+                  print("Missing key mappings:", file=sys.stderr)
+                  for key, expected, refs in missing:
+                      print(
+                          f"  - {key}: expected '{expected}' (referenced in {', '.join(refs)})",
+                          file=sys.stderr,
+                      )
+              if mismatches:
+                  print("Mismatched key mappings:", file=sys.stderr)
+                  for key, expected, actual, refs in mismatches:
+                      print(
+                          f"  - {key}: expected '{expected}', found '{actual}' (referenced in {', '.join(refs)})",
+                          file=sys.stderr,
+                      )
+              print(
+                  "\nUpdate config/uk_aq_github_env_targets.csv to match workflow vars/secrets usage.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print(
+              "Validated GitHub env targets:",
+              f"{len(mapping)} mapped keys,",
+              f"{len(var_refs)} vars refs,",
+              f"{len(secret_refs)} secrets refs.",
+          )
+          PY

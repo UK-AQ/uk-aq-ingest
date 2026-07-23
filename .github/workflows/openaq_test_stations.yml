@@ -1,0 +1,38 @@
+name: OpenAQ Stations Test Sync
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+jobs:
+  openaq-stations-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install requests python-dotenv psycopg2-binary
+
+      - name: Sync OpenAQ stations (test)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          OPENAQ_BASE_URL: ${{ vars.OPENAQ_BASE_URL }}
+          OPENAQ_API_KEY: ${{ secrets.OPENAQ_API_KEY }}
+          OPENAQ_RATE_LIMIT_PER_MIN: ${{ vars.OPENAQ_RATE_LIMIT_PER_MIN || '60' }}
+          OPENAQ_SHARED_BUDGET_ENFORCE: ${{ vars.OPENAQ_SHARED_BUDGET_ENFORCE || 'true' }}
+          OPENAQ_SHARED_BUDGET_KEY: ${{ vars.OPENAQ_SHARED_BUDGET_KEY || 'openaq' }}
+          OPENAQ_SHARED_BUDGET_MINUTE_LIMIT: ${{ vars.OPENAQ_SHARED_BUDGET_MINUTE_LIMIT || '40' }}
+          OPENAQ_SHARED_BUDGET_HOUR_LIMIT: ${{ vars.OPENAQ_SHARED_BUDGET_HOUR_LIMIT || '1500' }}
+          OPENAQ_SHARED_BUDGET_FAIL_OPEN: ${{ vars.OPENAQ_SHARED_BUDGET_FAIL_OPEN || 'false' }}
+        run: |
+          python3 scripts/openaq/openaq_list_stations.py --to-supabase --toggle-polling

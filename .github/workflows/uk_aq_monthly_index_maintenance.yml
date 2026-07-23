@@ -1,0 +1,223 @@
+name: UK-AQ Monthly Index Maintenance
+
+on:
+  schedule:
+    - cron: "35 5 1 * *"
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "apply or dry_run"
+        required: false
+        default: "apply"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  monthly-index-maintenance:
+    runs-on: ubuntu-latest
+    env:
+      MAIN_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      OBS_AQIDB_DB_URL: ${{ secrets.OBS_AQIDB_SUPABASE_DB_URL }}
+      RUN_MODE: ${{ inputs.run_mode || 'apply' }}
+      DENSITY_THRESHOLD: "80"
+      FRAGMENTATION_THRESHOLD: "15"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure psql is available
+        run: |
+          set -euo pipefail
+          if command -v psql >/dev/null 2>&1; then
+            psql --version
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          psql --version
+
+      - name: Reindex observations indexes when thresholds are exceeded
+        run: |
+          set -euo pipefail
+
+          if [ -z "${MAIN_DB_URL:-}" ]; then
+            echo "Missing required secret: SUPABASE_DB_URL" >&2
+            exit 1
+          fi
+          if [ -z "${OBS_AQIDB_DB_URL:-}" ]; then
+            echo "Missing required secret: OBS_AQIDB_SUPABASE_DB_URL" >&2
+            exit 1
+          fi
+
+          mode="$(printf '%s' "${RUN_MODE:-apply}" | tr '[:upper:]' '[:lower:]')"
+          if [ "${mode}" != "apply" ] && [ "${mode}" != "dry_run" ]; then
+            echo "Invalid RUN_MODE=${RUN_MODE}. Expected 'apply' or 'dry_run'." >&2
+            exit 1
+          fi
+
+          psql_cmd() {
+            local db_url="$1"
+            shift
+            PSQLRC=/dev/null psql "${db_url}" -v ON_ERROR_STOP=1 -P pager=off "$@"
+          }
+
+          ensure_pgstattuple() {
+            local db_url="$1"
+            psql_cmd "${db_url}" -q -c "create extension if not exists pgstattuple;"
+          }
+
+          list_main_indexes() {
+            psql_cmd "${MAIN_DB_URL}" -At -c "
+              select distinct format('%I.%I', i_ns.nspname, i.relname) as index_qname
+              from pg_index x
+              join pg_class t on t.oid = x.indrelid
+              join pg_namespace t_ns on t_ns.oid = t.relnamespace
+              join pg_class i on i.oid = x.indexrelid
+              join pg_namespace i_ns on i_ns.oid = i.relnamespace
+              join pg_am am on am.oid = i.relam
+              where t_ns.nspname = 'uk_aq_core'
+                and (t.relname = 'observations' or t.relname like 'observations_%')
+                and am.amname = 'btree'
+                and pg_relation_size(i.oid) > 0
+              order by 1;
+            "
+          }
+
+          list_obs_aqidb_indexes() {
+            psql_cmd "${OBS_AQIDB_DB_URL}" -At -c "
+              select format('%I.%I', i_ns.nspname, i.relname) as index_qname
+              from pg_index x
+              join pg_class t on t.oid = x.indrelid
+              join pg_namespace t_ns on t_ns.oid = t.relnamespace
+              join pg_class i on i.oid = x.indexrelid
+              join pg_namespace i_ns on i_ns.oid = i.relnamespace
+              join pg_am am on am.oid = i.relam
+              where t_ns.nspname = 'uk_aq_observs'
+                and t.relname = 'observations'
+                and am.amname = 'btree'
+                and pg_relation_size(i.oid) > 0
+              order by 1;
+            "
+          }
+
+          index_stats() {
+            local db_url="$1"
+            local idx="$2"
+            psql_cmd "${db_url}" -At -F $'\t' -c "
+              select
+                pg_relation_size('${idx}'::regclass)::bigint as index_bytes,
+                round((pgstatindex('${idx}'::regclass)).avg_leaf_density::numeric, 2) as avg_leaf_density,
+                round((pgstatindex('${idx}'::regclass)).leaf_fragmentation::numeric, 2) as leaf_fragmentation;
+            "
+          }
+
+          bytes_to_mb() {
+            awk -v bytes="$1" 'BEGIN { printf "%.2f", (bytes / 1024 / 1024) }'
+          }
+
+          needs_reindex() {
+            local density="$1"
+            local frag="$2"
+            awk \
+              -v density="${density}" \
+              -v frag="${frag}" \
+              -v density_threshold="${DENSITY_THRESHOLD}" \
+              -v frag_threshold="${FRAGMENTATION_THRESHOLD}" \
+              'BEGIN { if (density < density_threshold || frag > frag_threshold) print "yes"; else print "no" }'
+          }
+
+          reindex_if_needed() {
+            local label="$1"
+            local db_url="$2"
+            shift 2
+            local indexes=("$@")
+
+            if [ "${#indexes[@]}" -eq 0 ]; then
+              echo "No candidate indexes found for ${label}."
+              return
+            fi
+
+            for idx in "${indexes[@]}"; do
+              if [ -z "${idx}" ]; then
+                continue
+              fi
+
+              local before_stats
+              before_stats="$(index_stats "${db_url}" "${idx}")"
+              local before_bytes before_density before_frag
+              IFS=$'\t' read -r before_bytes before_density before_frag <<<"${before_stats}"
+
+              local action="skip"
+              local reason="healthy"
+              local after_bytes="${before_bytes}"
+              local after_density="${before_density}"
+              local after_frag="${before_frag}"
+
+              local should_reindex
+              should_reindex="$(needs_reindex "${before_density}" "${before_frag}")"
+              if [ "${should_reindex}" = "yes" ]; then
+                if [ "${mode}" = "apply" ]; then
+                  echo "[${label}] reindexing ${idx} (density=${before_density}, frag=${before_frag})"
+                  psql_cmd "${db_url}" -c "reindex index concurrently ${idx};"
+                  local after_stats
+                  after_stats="$(index_stats "${db_url}" "${idx}")"
+                  IFS=$'\t' read -r after_bytes after_density after_frag <<<"${after_stats}"
+                  action="reindexed"
+                  reason="threshold_exceeded"
+                else
+                  action="dry_run_needed"
+                  reason="threshold_exceeded"
+                fi
+              fi
+
+              local saved_bytes=$((before_bytes - after_bytes))
+              local before_mb after_mb saved_mb
+              before_mb="$(bytes_to_mb "${before_bytes}")"
+              after_mb="$(bytes_to_mb "${after_bytes}")"
+              saved_mb="$(bytes_to_mb "${saved_bytes}")"
+
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "${label}" \
+                "${idx}" \
+                "${before_bytes}" \
+                "${after_bytes}" \
+                "${saved_bytes}" \
+                "${before_density}" \
+                "${after_density}" \
+                "${before_frag}" \
+                "${after_frag}" \
+                "${action}" >> index_maintenance_results.tsv
+
+              echo "[${label}] ${idx} action=${action} reason=${reason} before_mb=${before_mb} after_mb=${after_mb} saved_mb=${saved_mb} before_density=${before_density} after_density=${after_density} before_frag=${before_frag} after_frag=${after_frag}"
+            done
+          }
+
+          ensure_pgstattuple "${MAIN_DB_URL}"
+          ensure_pgstattuple "${OBS_AQIDB_DB_URL}"
+
+          echo -e "db\tindex\tbefore_bytes\tafter_bytes\tsaved_bytes\tbefore_density\tafter_density\tbefore_frag\tafter_frag\taction" > index_maintenance_results.tsv
+
+          mapfile -t main_indexes < <(list_main_indexes)
+          mapfile -t obs_aqidb_indexes < <(list_obs_aqidb_indexes)
+
+          reindex_if_needed "main" "${MAIN_DB_URL}" "${main_indexes[@]}"
+          reindex_if_needed "obs_aqidb" "${OBS_AQIDB_DB_URL}" "${obs_aqidb_indexes[@]}"
+
+          {
+            echo "## Monthly Index Maintenance"
+            echo
+            echo "- Mode: \`${mode}\`"
+            echo "- Thresholds: density < \`${DENSITY_THRESHOLD}\`, fragmentation > \`${FRAGMENTATION_THRESHOLD}\`"
+            echo
+            echo "| DB | Index | Before MB | After MB | Saved MB | Before Density | After Density | Before Frag | After Frag | Action |"
+            echo "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+            awk -F'\t' 'NR>1 { printf("| %s | `%s` | %.2f | %.2f | %.2f | %s | %s | %s | %s | %s |\n", $1, $2, $3/1024/1024, $4/1024/1024, $5/1024/1024, $6, $7, $8, $9, $10) }' index_maintenance_results.tsv
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload maintenance report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uk-aq-monthly-index-maintenance-report
+          path: index_maintenance_results.tsv

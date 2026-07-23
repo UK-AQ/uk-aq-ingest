@@ -1,0 +1,1 @@
+./scripts/uk_aq_move_observations.sh --days 14 --batch-size 20000

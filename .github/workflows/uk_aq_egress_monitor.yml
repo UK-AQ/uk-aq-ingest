@@ -1,0 +1,35 @@
+name: UK-AQ Egress Monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  egress-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger egress monitor function
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SB_PUBLISHABLE_DEFAULT_KEY: ${{ secrets.SB_PUBLISHABLE_DEFAULT_KEY }}
+          SB_UK_AQ_CRON_SECRET: ${{ secrets.SB_UK_AQ_CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SUPABASE_URL:-}" ] || [ -z "${SB_PUBLISHABLE_DEFAULT_KEY:-}" ]; then
+            echo "Missing SUPABASE_URL or SB_PUBLISHABLE_DEFAULT_KEY secret." >&2
+            exit 1
+          fi
+          MONITOR_URL="${SUPABASE_URL%/}/functions/v1/uk_aq_egress_monitor?lookback_minutes=60&top_n=15&page_size=5000&max_rows=25000&runtime_budget_ms=115000&request_timeout_ms=20000"
+          curl --silent --show-error --fail-with-body \
+            --retry 2 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            -X POST \
+            "${MONITOR_URL}" \
+            -H "apikey: ${SB_PUBLISHABLE_DEFAULT_KEY}" \
+            -H "Content-Type: application/json" \
+            -H "X-Cron-Secret: ${SB_UK_AQ_CRON_SECRET:-}" \
+            -d '{}'

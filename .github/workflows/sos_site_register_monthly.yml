@@ -1,0 +1,46 @@
+name: SOS Site Register (Monthly)
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: "15 4 1 * *"
+  workflow_dispatch:
+
+jobs:
+  download-site-register:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install requests python-dotenv supabase
+
+      - name: Download UK-AIR SOS site register CSV
+        env:
+          SOS_SITE_SEARCH_URL: ${{ secrets.SOS_SITE_SEARCH_URL || 'https://uk-air.defra.gov.uk/networks/find-sites?site_name=&pollutant=9999&group_id=9999&country_id=9999&region_id=9999&location_type=9999&search=Search+Network&view=advanced&action=results' }}
+          SOS_SITE_SEARCH_USER_AGENT: ${{ secrets.SOS_SITE_SEARCH_USER_AGENT || 'Mozilla/5.0 (sos_site_register)' }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+          UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT }}
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+        run: |
+          python3 scripts/sos/sos_site_register.py \
+            --output sos_site_register.csv \
+            --site-ref-map-csv network_info/sos/sos_site_refs.csv \
+            --validate-site-ref-map \
+            --discover-site-refs \
+            --dropbox-upload \
+            --dropbox-dir network_info/sos \
+            --load

@@ -1,0 +1,128 @@
+name: UK-AQ PCON AIVAN Refresh
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      pcon_version:
+        description: Optional PCON version override (e.g., 2024).
+        required: false
+      la_version:
+        description: Optional LA version override (e.g., 2024).
+        required: false
+
+jobs:
+  refresh-pcon-aiven:
+    runs-on: ubuntu-latest
+    env:
+      PCON_VERSION: ${{ inputs.pcon_version || vars.PCON_VERSION }}
+      LA_VERSION: ${{ inputs.la_version || vars.LA_VERSION }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install requests python-dotenv psycopg2-binary
+
+      - name: Resolve PCON GeoJSON from Dropbox
+        env:
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          PCON_GEOJSON_DROPBOX_BASE: ${{ secrets.PCON_GEOJSON_DROPBOX_BASE }}
+          PCON_GEOJSON_DROPBOX_PATH: ${{ secrets.PCON_GEOJSON_DROPBOX_PATH }}
+        run: |
+          python3 scripts/uk_aq_resolve_dropbox_geojson.py \
+            --dropbox-base "${PCON_GEOJSON_DROPBOX_BASE}" \
+            --dropbox-path "${PCON_GEOJSON_DROPBOX_PATH}" \
+            --version "${PCON_VERSION}" \
+            --output "tmp/pcon.geojson" \
+            --env-prefix "PCON" \
+            --env-file "$GITHUB_ENV"
+
+      - name: Debug PCON env
+        run: |
+          echo "PCON_GEOJSON_PATH=$PCON_GEOJSON_PATH"
+          echo "PCON_VERSION=$PCON_VERSION"
+          if [ -n "$PCON_GEOJSON_PATH" ]; then
+            ls -l "$PCON_GEOJSON_PATH"
+          fi
+
+      - name: Resolve LA GeoJSON from Dropbox
+        env:
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          LA_GEOJSON_DROPBOX_BASE: ${{ secrets.LA_GEOJSON_DROPBOX_BASE }}
+          LA_GEOJSON_DROPBOX_PATH: ${{ secrets.LA_GEOJSON_DROPBOX_PATH }}
+        run: |
+          python3 scripts/uk_aq_resolve_dropbox_geojson.py \
+            --dropbox-base "${LA_GEOJSON_DROPBOX_BASE}" \
+            --dropbox-path "${LA_GEOJSON_DROPBOX_PATH}" \
+            --version "${LA_VERSION}" \
+            --output "tmp/la.geojson" \
+            --env-prefix "LA" \
+            --env-file "$GITHUB_ENV"
+
+      - name: Debug LA env
+        run: |
+          echo "LA_GEOJSON_PATH=$LA_GEOJSON_PATH"
+          echo "LA_VERSION=$LA_VERSION"
+          if [ -n "$LA_GEOJSON_PATH" ]; then
+            ls -l "$LA_GEOJSON_PATH"
+          fi
+
+      - name: Upload PCON boundaries to Aiven
+        env:
+          PCON_AIVEN_PG_DSN: ${{ secrets.PCON_AIVEN_PG_DSN }}
+          PCON_VERSION: ${{ env.PCON_VERSION }}
+          PCON_CODE_FIELD: ${{ secrets.PCON_CODE_FIELD }}
+          PCON_NAME_FIELD: ${{ secrets.PCON_NAME_FIELD }}
+          PCON_SLEEP_SECONDS: ${{ secrets.PCON_SLEEP_SECONDS }}
+          PCON_BOUNDARY_BATCH_SIZE: ${{ secrets.PCON_BOUNDARY_BATCH_SIZE }}
+          PCON_MAX_RETRIES: ${{ secrets.PCON_MAX_RETRIES }}
+          PCON_RETRY_BACKOFF_SECONDS: ${{ secrets.PCON_RETRY_BACKOFF_SECONDS }}
+        run: |
+          python3 scripts/uk_aq_load_pcon_boundaries_aiven.py \
+            --geojson "${PCON_GEOJSON_PATH}" \
+            --pcon-version "${PCON_VERSION}" \
+            --code-field "${PCON_CODE_FIELD:-PCON24CD}" \
+            --name-field "${PCON_NAME_FIELD:-PCON24NM}" \
+            --skip-if-exists \
+            --batch-size "${PCON_BOUNDARY_BATCH_SIZE:-5}" \
+            --sleep-seconds "${PCON_SLEEP_SECONDS:-1.0}" \
+            --max-retries "${PCON_MAX_RETRIES:-5}" \
+            --retry-backoff-seconds "${PCON_RETRY_BACKOFF_SECONDS:-2}"
+
+      - name: Upload LA boundaries to Aiven
+        env:
+          PCON_AIVEN_PG_DSN: ${{ secrets.PCON_AIVEN_PG_DSN }}
+          LA_VERSION: ${{ env.LA_VERSION }}
+          LA_CODE_FIELD: ${{ secrets.LA_CODE_FIELD }}
+          LA_NAME_FIELD: ${{ secrets.LA_NAME_FIELD }}
+          LA_SOURCE_SRID: ${{ secrets.LA_SOURCE_SRID }}
+          LA_SLEEP_SECONDS: ${{ secrets.LA_SLEEP_SECONDS }}
+          LA_BOUNDARY_BATCH_SIZE: ${{ secrets.LA_BOUNDARY_BATCH_SIZE }}
+          LA_MAX_RETRIES: ${{ secrets.LA_MAX_RETRIES }}
+          LA_RETRY_BACKOFF_SECONDS: ${{ secrets.LA_RETRY_BACKOFF_SECONDS }}
+        run: |
+          python3 scripts/uk_aq_load_la_boundaries_aiven.py \
+            --geojson "${LA_GEOJSON_PATH}" \
+            --la-version "${LA_VERSION}" \
+            --code-field "${LA_CODE_FIELD:-LAD25CD}" \
+            --name-field "${LA_NAME_FIELD:-LAD25NM}" \
+            --source-srid "${LA_SOURCE_SRID:-27700}" \
+            --skip-if-exists \
+            --batch-size "${LA_BOUNDARY_BATCH_SIZE:-50}" \
+            --sleep-seconds "${LA_SLEEP_SECONDS:-0.5}" \
+            --max-retries "${LA_MAX_RETRIES:-5}" \
+            --retry-backoff-seconds "${LA_RETRY_BACKOFF_SECONDS:-2}"

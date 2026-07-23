@@ -1,0 +1,15 @@
+{
+  "lock": "deno.lock",
+  "compilerOptions": {
+    "lib": ["deno.ns", "dom", "dom.iterable"]
+  },
+  "lint": {
+    "include": ["supabase/functions"],
+    "rules": {
+      "exclude": ["no-import-prefix", "no-explicit-any", "ban-ts-comment"]
+    }
+  },
+  "fmt": {
+    "include": ["supabase/functions"]
+  }
+}

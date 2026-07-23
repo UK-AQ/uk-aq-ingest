@@ -1,0 +1,37 @@
+name: UK-AQ Obs AQI Egress Monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  egress-monitor-obs-aqi:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger obs_aqidb egress monitor function
+        env:
+          OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+          OBS_AQIDB_PUBLISHABLE_DEFAULT_KEY: ${{ secrets.OBS_AQIDB_PUBLISHABLE_DEFAULT_KEY }}
+          SB_UK_AQ_CRON_SECRET: ${{ secrets.SB_UK_AQ_CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OBS_AQIDB_SUPABASE_URL:-}" ] || [ -z "${OBS_AQIDB_PUBLISHABLE_DEFAULT_KEY:-}" ]; then
+            echo "Missing OBS_AQIDB_SUPABASE_URL or OBS_AQIDB_PUBLISHABLE_DEFAULT_KEY." >&2
+            exit 1
+          fi
+          MONITOR_URL="${OBS_AQIDB_SUPABASE_URL%/}/functions/v1/uk_aq_egress_monitor?lookback_minutes=60&top_n=15&page_size=5000&max_rows=25000&runtime_budget_ms=115000&request_timeout_ms=20000"
+          curl --silent --show-error --fail-with-body \
+            --retry 2 \
+            --retry-delay 5 \
+            --retry-max-time 210 \
+            --connect-timeout 20 \
+            --max-time 150 \
+            -X POST \
+            "${MONITOR_URL}" \
+            -H "apikey: ${OBS_AQIDB_PUBLISHABLE_DEFAULT_KEY}" \
+            -H "Content-Type: application/json" \
+            -H "X-Cron-Secret: ${SB_UK_AQ_CRON_SECRET:-}" \
+            -d '{}'

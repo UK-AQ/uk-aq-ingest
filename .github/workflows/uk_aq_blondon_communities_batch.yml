@@ -1,0 +1,42 @@
+name: UK-AQ Breathe London Communities Batch Ingest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-blondon-communities-batch
+  cancel-in-progress: false
+
+jobs:
+  blondon-communities-batch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install requests supabase
+
+      - name: Batch ingest Breathe London Communities
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+          SB_PUBLISHABLE_DEFAULT_KEY: ${{ secrets.SB_PUBLISHABLE_DEFAULT_KEY }}
+          SB_UK_AQ_CRON_SECRET: ${{ secrets.SB_UK_AQ_CRON_SECRET }}
+        run: |
+          python3 scripts/blondon_communities/blondon_communities_batch.py \
+            --connector-code blondon_communities \
+            --service-ref breathelondon \
+            --batch-size 10 \
+            --active-only \
+            --skip-stations

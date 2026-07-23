@@ -1,0 +1,31 @@
+name: UK-AQ Stations Enrich Test
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+jobs:
+  enrich-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install requests python-dotenv
+
+      - name: Debug station_name counts
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+        run: |
+          python3 scripts/uk_aq_enrich_test_script.py --samples 5 --verbose
