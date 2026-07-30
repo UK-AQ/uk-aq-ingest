@@ -9,10 +9,12 @@ COPY workers/shared/dropbox_error_log.ts /app/workers/shared/dropbox_error_log.t
 
 # Reuse existing OpenAQ ingest implementation + shared helpers.
 COPY supabase/functions/ingest_openaq/index.ts /app/runtime/ingest_openaq/index.ts
+COPY supabase/functions/ingest_openaq/ingestdb_observation_write.mjs /app/runtime/ingest_openaq/ingestdb_observation_write.mjs
 COPY supabase/functions/_shared/cache.ts /app/runtime/_shared/cache.ts
 COPY supabase/functions/_shared/fetch_egress_patch.ts /app/runtime/_shared/fetch_egress_patch.ts
 COPY supabase/functions/_shared/egress_metrics.ts /app/runtime/_shared/egress_metrics.ts
 COPY supabase/functions/_shared/observs_client.ts /app/runtime/_shared/observs_client.ts
+COPY supabase/functions/_shared/ingestdb_observation_writer.mjs /app/runtime/_shared/ingestdb_observation_writer.mjs
 COPY supabase/functions/_shared/fetch_egress_patch.ts /app/supabase/functions/_shared/fetch_egress_patch.ts
 COPY supabase/functions/_shared/egress_metrics.ts /app/supabase/functions/_shared/egress_metrics.ts
 
