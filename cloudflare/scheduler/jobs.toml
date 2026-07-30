@@ -38,7 +38,7 @@ cron_expr = "*/30 * * * *"
 target_type = "cloud_run"
 cloud_run_url_managed_by_deploy = true
 cloud_run_method = "POST"
-dry_run = true
+dry_run = false
 notes = "OpenAQ safety trigger; service decides whether work is needed"
 
 [jobs.uk_aq_openaq_safety.cloud_run_body]
