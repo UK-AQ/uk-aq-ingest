@@ -6,6 +6,11 @@ import {
   type ObservsObservationRow,
   writeObservsWithOutbox,
 } from "../_shared/observs_client.ts";
+import {
+  createEmptyIngestDbObservationWriteStats,
+  isIngestDbObservationWriteError,
+  writeIngestDbObservations,
+} from "../_shared/ingestdb_observation_writer.mjs";
 
 type PollRequest = {
   connector_id?: string;
@@ -295,7 +300,16 @@ async function postgrestRequest<T>(
   body?: unknown,
   prefer?: string,
   schema?: string,
-): Promise<{ data: T | null; error: { message: string } | null }> {
+): Promise<{
+  data: T | null;
+  error: {
+    message: string;
+    code?: string | null;
+    details?: string | null;
+    hint?: string | null;
+    http_status?: number | null;
+  } | null;
+}> {
   if (!REST_BASE_URL || !SUPABASE_PRIVILEGED_KEY) {
     return {
       data: null,
@@ -333,7 +347,21 @@ async function postgrestRequest<T>(
         (payload as { error_description?: string })?.error_description ??
         (payload as { error?: string })?.error ??
         resp.statusText;
-      return { data: null, error: { message: String(message) } };
+      const errorPayload = payload && typeof payload === "object"
+        ? payload as Record<string, unknown>
+        : {};
+      return {
+        data: null,
+        error: {
+          message: String(message),
+          code: errorPayload.code == null ? null : String(errorPayload.code),
+          details: errorPayload.details == null
+            ? null
+            : String(errorPayload.details),
+          hint: errorPayload.hint == null ? null : String(errorPayload.hint),
+          http_status: resp.status,
+        },
+      };
     }
     return { data: payload as T, error: null };
   } catch (err) {
@@ -1004,27 +1032,26 @@ async function fetchTimeseriesIds(
 
 async function upsertObservations(
   rows: Array<Record<string, unknown>>,
-): Promise<number> {
-  if (!rows.length) {
-    return 0;
-  }
-  let written = 0;
-  for (
-    let idx = 0;
-    idx < rows.length;
-    idx += SCOMM_OBSERVATION_UPSERT_CHUNK_SIZE
-  ) {
-    const chunk = rows.slice(idx, idx + SCOMM_OBSERVATION_UPSERT_CHUNK_SIZE);
-    await postgrestRequest(
-      "POST",
-      "observations",
-      { on_conflict: "connector_id,timeseries_id,observed_at" },
-      chunk,
-      "resolution=merge-duplicates,return=minimal",
-    );
-    written += chunk.length;
-  }
-  return written;
+  runtimeBudget?: { shouldStop: () => boolean; remainingRuntimeMs: () => number },
+) {
+  return await writeIngestDbObservations({
+    rows,
+    chunkSize: SCOMM_OBSERVATION_UPSERT_CHUNK_SIZE,
+    connectorCode: SCOMM_CONNECTOR_CODE,
+    logger: console,
+    runtimeBudget,
+    config: { minimumAttemptRuntimeMs: DEFAULT_TIMEOUT_MS },
+    writeChunk: async (chunk: Array<Record<string, unknown>>) => {
+      const { error } = await postgrestRequest(
+        "POST",
+        "observations",
+        { on_conflict: "connector_id,timeseries_id,observed_at" },
+        chunk,
+        "resolution=merge-duplicates,return=minimal",
+      );
+      if (error) throw error;
+    },
+  });
 }
 
 function observationValueDedupeToken(value: unknown): string {
@@ -1758,6 +1785,8 @@ serve(async (req) => {
   let stationsCount = 0;
   let timeseriesCount = 0;
   let observationsUpserted = 0;
+  let ingestDbObservationWriteStats =
+    createEmptyIngestDbObservationWriteStats();
   let observationsRowsInput = 0;
   let observationsRowsPrepared = 0;
   let observationsRowsDedupedPrewrite = 0;
@@ -2103,7 +2132,13 @@ serve(async (req) => {
 
               timeseriesCount = timeseriesPayload.length;
               if (!budgetStopPhase && checkBudget("before_upsert_timeseries")) {
-                await upsertTimeseries(timeseriesPayload);
+                // Metadata must exist before observation rows can reference it,
+                // but latest-value state advances only after IngestDB commits.
+                const timeseriesMetadataPayload = timeseriesPayload.map(
+                  ({ last_value: _lastValue, last_value_at: _lastValueAt, ...metadata }) =>
+                    metadata,
+                );
+                await upsertTimeseries(timeseriesMetadataPayload);
               }
               const timeseriesRefs = Array.from(timeseriesRefSet);
               if (
@@ -2152,8 +2187,14 @@ serve(async (req) => {
               observsRowsDedupedPrewrite = observationsRowsDedupedPrewrite;
 
               if (!budgetStopPhase && checkBudget("before_dual_write")) {
-                const [observationWriteResult] = await Promise.all([
-                  upsertObservations(observationRows),
+                // IngestDB and ObsAQIDB are intentionally independent; no
+                // cross-database transaction exists.
+                const [ingestDbResult, observsResult] = await Promise.allSettled([
+                  upsertObservations(observationRows, {
+                    shouldStop,
+                    remainingRuntimeMs: () =>
+                      Math.max(0, processingDeadline - Date.now()),
+                  }),
                   writeObservsWithOutbox(
                     publicRpcRequest,
                     observsRows,
@@ -2165,7 +2206,51 @@ serve(async (req) => {
                     },
                   ),
                 ]);
-                observationsUpserted = observationWriteResult;
+                if (ingestDbResult.status === "rejected") {
+                  const error = ingestDbResult.reason instanceof Error
+                    ? ingestDbResult.reason
+                    : new Error(String(ingestDbResult.reason));
+                  (error as Error & { writeResults?: Record<string, unknown> })
+                    .writeResults = {
+                      ingestdb_observation_write:
+                        (error as Error & { stats?: Record<string, unknown> })
+                          .stats ?? null,
+                      cross_database_transaction: false,
+                      obsaqidb_write: observsResult.status === "fulfilled"
+                        ? { status: "succeeded", ...observsResult.value }
+                        : {
+                          status: "failed",
+                          message: observsResult.reason instanceof Error
+                            ? observsResult.reason.message
+                            : String(observsResult.reason),
+                        },
+                    };
+                  throw error;
+                }
+                if (checkBudget("before_commit_timeseries_last_value")) {
+                  await upsertTimeseries(timeseriesPayload);
+                }
+                if (observsResult.status === "rejected") {
+                  const error = observsResult.reason instanceof Error
+                    ? observsResult.reason
+                    : new Error(String(observsResult.reason));
+                  (error as Error & { writeResults?: Record<string, unknown> })
+                    .writeResults = {
+                      ingestdb_observation_write: {
+                        status: "succeeded",
+                        ...ingestDbResult.value,
+                      },
+                      cross_database_transaction: false,
+                      obsaqidb_write: {
+                        status: "failed",
+                        message: error.message,
+                      },
+                    };
+                  throw error;
+                }
+                const observationWriteResult = ingestDbResult.value;
+                ingestDbObservationWriteStats = observationWriteResult;
+                observationsUpserted = observationWriteResult.committed_rows;
               }
 
               if (
@@ -2223,6 +2308,8 @@ serve(async (req) => {
                 timeseries_updated: timeseriesCount,
                 observations: observationsUpserted,
                 observations_upserted: observationsUpserted,
+                ingestdb_observation_write: ingestDbObservationWriteStats,
+                cross_database_transaction: false,
                 observations_rows_input: observationsRowsInput,
                 observations_rows_prepared: observationsRowsPrepared,
                 observations_rows_deduped_prewrite:
@@ -2252,7 +2339,41 @@ serve(async (req) => {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     status = 500;
-    responsePayload = { ok: false, error: "Internal server error." };
+    if (isIngestDbObservationWriteError(err)) {
+      const writeError = err as {
+        stats?: Record<string, unknown>;
+        classification?: string;
+        terminalReason?: string;
+        writeResults?: Record<string, unknown>;
+      };
+      responsePayload = {
+        ok: false,
+        error: "IngestDB observation write failed.",
+        observations_upserted: Number(
+          writeError.stats?.committed_rows ?? 0,
+        ),
+        ingestdb_observation_write: writeError.stats ?? null,
+        cross_database_transaction: false,
+        failure_classification: writeError.classification ?? null,
+        terminal_reason: writeError.terminalReason ?? null,
+        obsaqidb_write: writeError.writeResults?.obsaqidb_write ?? null,
+      };
+    } else {
+      const writeResults = (err as Error & {
+        writeResults?: Record<string, unknown>;
+      })?.writeResults;
+      responsePayload = writeResults
+        ? {
+          ok: false,
+          error: "ObsAQIDB observation write failed.",
+          observations_upserted: Number(
+            (writeResults.ingestdb_observation_write as Record<string, unknown>)
+              ?.committed_rows ?? 0,
+          ),
+          ...writeResults,
+        }
+        : { ok: false, error: "Internal server error." };
+    }
     log.error("Unhandled error during poll.", { message });
     if (!shouldStop()) {
       await errorLogger.logError({

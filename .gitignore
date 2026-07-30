@@ -32,4 +32,4 @@ workers/uk_aq_breathelondon_cloud_run.zip
 workers/uk_aq_blondon_communities_cloud_run.zip
 supabase/functions/ingest_breathelondon/index.ts.zip
 *.bak
-/.continue
+.continue/agents/mistral-devstral-latest.yaml
