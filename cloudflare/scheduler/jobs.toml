@@ -29,7 +29,7 @@ cron_expr = "*/5 * * * *"
 target_type = "cloud_run"
 cloud_run_url_managed_by_deploy = true
 cloud_run_method = "POST"
-dry_run = false
+dry_run = true
 notes = "Breathe London Nodes scheduled ingest trigger"
 
 [jobs.uk_aq_openaq_safety]
