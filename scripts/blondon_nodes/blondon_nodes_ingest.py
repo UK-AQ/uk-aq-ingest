@@ -34,11 +34,14 @@ from scripts.blondon_nodes.blondon_nodes_reference_data import (
     build_nodes_timeseries_rows,
     upsert_nodes_phenomena,
 )
+from scripts.blondon_nodes.blondon_nodes_raw_capture import NodesRawCapture
 from scripts.uk_aq_ingestdb_observation_writer import (
     DEFAULT_POSTGREST_ATTEMPT_RUNTIME_MS,
     IngestDbObservationWriteError,
+    build_compact_observation_rpc_args,
     empty_stats,
     merge_stats,
+    serialized_json_utf8_bytes,
     write_observations,
 )
 load_dotenv()
@@ -107,15 +110,29 @@ def parse_species(value: Optional[str]) -> List[str]:
 
 
 class BreatheLondonNodesClient:
-    def __init__(self, api_key: str, base_url: str = BASE_URL, timeout: int = 60, retries: int = 3) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = BASE_URL,
+        timeout: int = 60,
+        retries: int = 3,
+        raw_capture: Optional[NodesRawCapture] = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.retries = retries
+        self.raw_capture = raw_capture
         self.session = requests.Session()
         self.session.headers.update({"X-API-KEY": api_key, "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "uk-air-quality-networks"})
 
     def sensor_data(self, site_code: str, species: str, start_time: datetime, end_time: datetime) -> List[Dict[str, Any]]:
         params = {"SiteCode": site_code, "Species": species, "startTime": iso_z(start_time), "endTime": iso_z(end_time)}
+        raw_params = {
+            "SiteCode": site_code,
+            "Species": species,
+            "StartTime": params["startTime"],
+            "EndTime": params["endTime"],
+        }
         url = f"{self.base_url}/SensorData"
         for attempt in range(1, self.retries + 1):
             try:
@@ -125,9 +142,23 @@ class BreatheLondonNodesClient:
                 resp.raise_for_status()
                 payload = resp.json()
                 if payload is None:
+                    if self.raw_capture:
+                        self.raw_capture.record_response(
+                            "/SensorData",
+                            raw_params,
+                            resp.status_code,
+                            payload,
+                        )
                     return []
                 if not isinstance(payload, list):
                     raise RuntimeError(f"Unexpected /SensorData payload type: {type(payload).__name__}")
+                if self.raw_capture:
+                    self.raw_capture.record_response(
+                        "/SensorData",
+                        raw_params,
+                        resp.status_code,
+                        payload,
+                    )
                 return [row for row in payload if isinstance(row, dict)]
             except requests.RequestException as exc:
                 LOG.warning("Nodes request failed (attempt %s/%s): %s", attempt, self.retries, exc)
@@ -223,7 +254,14 @@ class ObservsWriter:
             }
         if self.mode == "direct":
             assert self.direct is not None
-            self.direct.rpc("uk_aq_rpc_observs_observations_upsert", {"rows": payload}).execute()
+            self.direct.rpc(
+                "uk_aq_rpc_observs_observations_compact_upsert_v1",
+                {
+                    "timeseries_ids": [row["timeseries_id"] for row in payload],
+                    "observed_ats": [row["observed_at"] for row in payload],
+                    "values": [row["value"] for row in payload],
+                },
+            ).execute()
             return {
                 "written": len(payload),
                 "enqueued": 0,
@@ -282,14 +320,33 @@ class SupabaseWriter:
         return upsert_nodes_phenomena(self.public, connector_id, species)
 
     def upsert_timeseries(self, rows: Sequence[Dict[str, Any]]) -> Dict[str, int]:
-        if rows:
-            self.core.table("timeseries").upsert(list(rows), on_conflict="connector_id,timeseries_ref").execute()
+        if not rows:
+            return {}
         refs = [r["timeseries_ref"] for r in rows]
         out: Dict[str, int] = {}
         for refs_chunk in chunked(refs, 200):
             resp = self.core.table("timeseries").select("id,timeseries_ref").eq("connector_id", rows[0]["connector_id"]).in_("timeseries_ref", refs_chunk).execute()
             for r in resp.data or []:
                 out[str(r["timeseries_ref"])] = int(r["id"])
+        missing_rows = [row for row in rows if row["timeseries_ref"] not in out]
+        if missing_rows:
+            self.core.table("timeseries").upsert(
+                missing_rows, on_conflict="connector_id,timeseries_ref"
+            ).execute()
+            missing_refs = [row["timeseries_ref"] for row in missing_rows]
+            for refs_chunk in chunked(missing_refs, 200):
+                resp = self.core.table("timeseries").select(
+                    "id,timeseries_ref"
+                ).eq("connector_id", rows[0]["connector_id"]).in_(
+                    "timeseries_ref", refs_chunk
+                ).execute()
+                for result_row in resp.data or []:
+                    out[str(result_row["timeseries_ref"])] = int(result_row["id"])
+        unresolved = [ref for ref in refs if ref not in out]
+        if unresolved:
+            raise RuntimeError(
+                f"Missing Nodes timeseries identities after self-repair: {unresolved[:10]}"
+            )
         return out
 
     def upsert_observations(self, rows: Sequence[Dict[str, Any]]) -> int:
@@ -305,9 +362,9 @@ class SupabaseWriter:
         ]
 
         def write_chunk(chunk: Sequence[Dict[str, Any]]) -> None:
-            self.core.table("observations").upsert(
-                list(chunk),
-                on_conflict="connector_id,timeseries_id,observed_at",
+            self.public.rpc(
+                "uk_aq_rpc_observations_compact_upsert_v1",
+                build_compact_observation_rpc_args(chunk),
             ).execute()
 
         try:
@@ -320,6 +377,9 @@ class SupabaseWriter:
                 config={
                     "minimum_attempt_runtime_ms": DEFAULT_POSTGREST_ATTEMPT_RUNTIME_MS,
                 },
+                request_body_bytes=lambda chunk: serialized_json_utf8_bytes(
+                    build_compact_observation_rpc_args(chunk)
+                ),
             )
         except IngestDbObservationWriteError as exc:
             merge_stats(self.observation_write_stats, exc.stats)
@@ -342,7 +402,8 @@ class SupabaseWriter:
             for row in resp.data or []:
                 existing[int(row["id"])] = dict(row)
 
-        updated = 0
+        updated_ids: set[int] = set()
+        latest_rows: List[Dict[str, Any]] = []
         for timeseries_id, timeseries_rows in grouped.items():
             ordered = sorted(
                 timeseries_rows,
@@ -356,25 +417,53 @@ class SupabaseWriter:
             current = existing.get(timeseries_id, {})
             current_first = parse_iso(current.get("first_value_at"))
             current_last = parse_iso(current.get("last_value_at"))
-            patch: Dict[str, Any] = {}
             if earliest_at and (current_first is None or earliest_at < current_first):
-                patch["first_value_at"] = earliest_at.isoformat()
+                self.core.table("timeseries").update(
+                    {"first_value_at": earliest_at.isoformat()}
+                ).eq("id", timeseries_id).execute()
+                updated_ids.add(timeseries_id)
             if latest_at and (current_last is None or latest_at > current_last):
-                patch["last_value_at"] = latest_at.isoformat()
-                patch["last_value"] = latest["value"]
+                latest_rows.append({
+                    "id": timeseries_id,
+                    "last_value_at": latest_at.isoformat(),
+                    "last_value": latest["value"],
+                })
             elif (
                 latest_at
                 and current_last
                 and latest_at == current_last
                 and current.get("last_value") != latest["value"]
             ):
-                patch["last_value"] = latest["value"]
-            if patch:
-                self.core.table("timeseries").update(patch).eq(
-                    "id", timeseries_id
-                ).execute()
-                updated += 1
-        return updated
+                latest_rows.append({
+                    "id": timeseries_id,
+                    "last_value_at": latest_at.isoformat(),
+                    "last_value": latest["value"],
+                })
+        if latest_rows:
+            latest_args = {
+                "timeseries_ids": [row["id"] for row in latest_rows],
+                "last_values": [row["last_value"] for row in latest_rows],
+                "last_value_ats": [row["last_value_at"] for row in latest_rows],
+            }
+            LOG.info(
+                "postgrest_request_metric %s",
+                json.dumps(
+                    {
+                        "metric": "uk_aq_endpoint_egress",
+                        "endpoint": "postgrest:rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+                        "caller": "uk_aq_blondon_nodes_cloud_run",
+                        "request_count": 1,
+                        "request_body_bytes": serialized_json_utf8_bytes(latest_args),
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+            self.public.rpc(
+                "uk_aq_rpc_timeseries_last_values_compact_update_v1",
+                latest_args,
+            ).execute()
+            updated_ids.update(row["id"] for row in latest_rows)
+        return len(updated_ids)
 
     def upsert_station_checkpoints(self, rows: Sequence[Dict[str, Any]]) -> None:
         if rows:
@@ -415,11 +504,65 @@ def write_secondary_rows(
     return stats
 
 
-def build_rows(payload: Sequence[Dict[str, Any]], timeseries_id: int, connector_id: int, station_id: int, species: str) -> Tuple[List[Dict[str, Any]], int, Optional[str], Optional[float]]:
-    rows = []
+def deduplicate_source_rows(
+    rows: Sequence[Dict[str, Any]],
+    station_ref: str,
+    species: str,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    grouped: Dict[Tuple[int, str], List[Tuple[int, Dict[str, Any]]]] = {}
+    for source_index, row in enumerate(rows):
+        identity = (int(row["timeseries_id"]), str(row["observed_at"]))
+        grouped.setdefault(identity, []).append((source_index, row))
+
+    winners: List[Tuple[int, Dict[str, Any]]] = []
+    duplicate_rows_deduplicated = 0
+    conflicting_duplicate_timestamps = 0
+    for (_timeseries_id, observed_at), candidates in grouped.items():
+        winner_index, winner = candidates[-1]
+        winners.append((winner_index, winner))
+        duplicate_rows_deduplicated += len(candidates) - 1
+        if len(candidates) < 2:
+            continue
+
+        first = candidates[0][1]
+        value_differed = any(
+            candidate[1]["value"] != first["value"] for candidate in candidates[1:]
+        )
+        status_differed = any(
+            candidate[1]["status"] != first["status"] for candidate in candidates[1:]
+        )
+        if value_differed or status_differed:
+            conflicting_duplicate_timestamps += 1
+            LOG.warning(
+                "Nodes source conflicting duplicate timestamp "
+                "station_ref=%s species=%s observed_at=%s "
+                "value_differed=%s status_differed=%s candidate_count=%s",
+                station_ref[:100],
+                species[:50],
+                observed_at[:40],
+                value_differed,
+                status_differed,
+                len(candidates),
+            )
+
+    winners.sort(key=lambda item: item[0])
+    return (
+        [winner for _source_index, winner in winners],
+        duplicate_rows_deduplicated,
+        conflicting_duplicate_timestamps,
+    )
+
+
+def build_rows(
+    payload: Sequence[Dict[str, Any]],
+    timeseries_id: int,
+    connector_id: int,
+    station_id: int,
+    station_ref: str,
+    species: str,
+) -> Tuple[List[Dict[str, Any]], int, Optional[str], Optional[float], int, int]:
+    candidate_rows = []
     nulls = 0
-    last_at: Optional[datetime] = None
-    last_value: Optional[float] = None
     for entry in payload:
         value = coerce_float(entry.get("ScaledValue"))
         if value is None:
@@ -431,10 +574,28 @@ def build_rows(payload: Sequence[Dict[str, Any]], timeseries_id: int, connector_
         status = entry.get("RatificationStatus")
         if status is not None:
             status = str(status).strip() or None
-        rows.append({"connector_id": connector_id, "station_id": station_id, "timeseries_id": timeseries_id, "observed_at": observed.isoformat(), "value": value, "status": status, "metadata": meta, "species": species})
+        candidate_rows.append({"connector_id": connector_id, "station_id": station_id, "timeseries_id": timeseries_id, "observed_at": observed.isoformat(), "value": value, "status": status, "metadata": meta, "species": species})
+
+    rows, duplicate_rows_deduplicated, conflicting_duplicate_timestamps = (
+        deduplicate_source_rows(candidate_rows, station_ref, species)
+    )
+    last_at: Optional[datetime] = None
+    last_value: Optional[float] = None
+    for row in rows:
+        observed = parse_iso(row["observed_at"])
+        if observed is None:
+            continue
         if last_at is None or observed > last_at:
-            last_at = observed; last_value = value
-    return rows, nulls, (last_at.isoformat() if last_at else None), last_value
+            last_at = observed
+            last_value = row["value"]
+    return (
+        rows,
+        nulls,
+        (last_at.isoformat() if last_at else None),
+        last_value,
+        duplicate_rows_deduplicated,
+        conflicting_duplicate_timestamps,
+    )
 
 
 def select_due_stations(
@@ -511,8 +672,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
+def run_ingest(args: argparse.Namespace, raw_capture: NodesRawCapture) -> int:
     species = parse_species(args.species)
     if not species:
         raise SystemExit("No valid species selected.")
@@ -524,6 +684,7 @@ def main() -> int:
     connector_id = int(connector["id"])
     if connector.get("poll_enabled") is False and not (args.start_time or args.site_code):
         LOG.info("Connector blondon_nodes poll_enabled=false; exiting normal scheduled run.")
+        raw_capture.finalize_safely()
         emit_run_summary(
             {
                 "ok": True,
@@ -552,11 +713,14 @@ def main() -> int:
                 "observs_error_count": 0,
                 "observs_error_message": None,
                 "null_values_skipped": 0,
+                "source_duplicate_rows_deduplicated": 0,
+                "source_conflicting_duplicate_timestamps": 0,
                 "empty_series": 0,
                 "checkpoints": 0,
                 "partial": False,
                 "stopped_reason": "poll_disabled",
                 "dry_run": args.dry_run,
+                **raw_capture.summary_fields(),
             }
         )
         return 0
@@ -578,6 +742,7 @@ def main() -> int:
         len(all_stations),
     )
     if not stations:
+        raw_capture.finalize_safely()
         emit_run_summary(
             {
                 "ok": True,
@@ -606,11 +771,14 @@ def main() -> int:
                 "observs_error_count": 0,
                 "observs_error_message": None,
                 "null_values_skipped": 0,
+                "source_duplicate_rows_deduplicated": 0,
+                "source_conflicting_duplicate_timestamps": 0,
                 "empty_series": 0,
                 "checkpoints": 0,
                 "partial": False,
                 "stopped_reason": "no_due_stations",
                 "dry_run": args.dry_run,
+                **raw_capture.summary_fields(),
             }
         )
         return 0
@@ -629,7 +797,7 @@ def main() -> int:
         species=species,
     )
     ts_ids = writer.upsert_timeseries(ts_rows) if not args.dry_run else {r["timeseries_ref"]: -i-1 for i, r in enumerate(ts_rows)}
-    client = BreatheLondonNodesClient(api_key)
+    client = BreatheLondonNodesClient(api_key, raw_capture=raw_capture)
     secondary_errors: List[str] = []
     secondary_error_count = 0
     try:
@@ -645,8 +813,25 @@ def main() -> int:
         hours=max(poll_hours, 0.1)
     )
     explicit_start = parse_iso(args.start_time)
+    raw_capture.record_context(
+        {
+            "connector_code": CONNECTOR_CODE,
+            "connector_id": connector_id,
+            "selected_species": species,
+            "selected_station_count": len(stations),
+            "run_end_time": end_time.isoformat(),
+            "explicit_start_time": (
+                explicit_start.isoformat() if explicit_start is not None else None
+            ),
+            "poll_window_hours": poll_hours,
+            "overlap_minutes": args.overlap_minutes,
+            "dry_run": args.dry_run,
+        }
+    )
     api_calls = observations_input = observations_upserted = 0
     null_values_skipped = empty_series = pub_obs = 0
+    source_duplicate_rows_deduplicated = 0
+    source_conflicting_duplicate_timestamps = 0
     observs_rows_prepared = observs_written = observs_enqueued = 0
     stations_processed = 0
     stopped_reason: Optional[str] = None
@@ -691,8 +876,24 @@ def main() -> int:
                 payload = client.sensor_data(station_ref, sp, start_time, end_time); api_calls += 1
                 if not payload:
                     empty_series += 1
-                rows, nulls, last_at, last_value = build_rows(payload, int(ts_id), connector_id, station_id, sp)
+                (
+                    rows,
+                    nulls,
+                    last_at,
+                    last_value,
+                    duplicate_rows_deduplicated,
+                    conflicting_duplicate_timestamps,
+                ) = build_rows(
+                    payload,
+                    int(ts_id),
+                    connector_id,
+                    station_id,
+                    station_ref,
+                    sp,
+                )
                 null_values_skipped += nulls
+                source_duplicate_rows_deduplicated += duplicate_rows_deduplicated
+                source_conflicting_duplicate_timestamps += conflicting_duplicate_timestamps
                 observations_input += len(rows)
                 if rows and not args.dry_run:
                     rows_chunks = [
@@ -805,6 +1006,7 @@ def main() -> int:
     secondary_error_message = (
         "; ".join(secondary_errors)[:4000] if secondary_errors else None
     )
+    raw_capture.finalize_safely()
     summary = {
         "ok": True,
         "connector_id": connector_id,
@@ -833,11 +1035,14 @@ def main() -> int:
         "observs_error_count": secondary_error_count,
         "observs_error_message": secondary_error_message,
         "null_values_skipped": null_values_skipped,
+        "source_duplicate_rows_deduplicated": source_duplicate_rows_deduplicated,
+        "source_conflicting_duplicate_timestamps": source_conflicting_duplicate_timestamps,
         "empty_series": empty_series,
         "checkpoints": len(checkpoint_rows) if not args.dry_run else 0,
         "partial": partial,
         "stopped_reason": stopped_reason,
         "dry_run": args.dry_run,
+        **raw_capture.summary_fields(),
     }
     LOG.info(
         "Nodes ingest complete stations=%s species=%s api_calls=%s observations=%s "
@@ -850,6 +1055,15 @@ def main() -> int:
     )
     emit_run_summary(summary)
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    raw_capture = NodesRawCapture.from_environment()
+    try:
+        return run_ingest(args, raw_capture)
+    finally:
+        raw_capture.finalize_safely()
 
 
 if __name__ == "__main__":
