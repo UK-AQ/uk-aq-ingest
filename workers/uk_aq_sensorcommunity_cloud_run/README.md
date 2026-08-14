@@ -28,6 +28,7 @@ This worker runs Sensor.Community ingest directly in Cloud Run Service
 - On rule threshold crossing, inserts a warning row in `uk_aq_raw.error_logs` and (when Dropbox error logging is enabled) uploads alert JSON to:
   - `{UK_AQ_DROPBOX_ROOT}/error_log/YYYY-MM-DD/`
 - Writes run status back to `connectors` and inserts `uk_aq_ingest_runs` row.
+- Run telemetry keeps `stations_updated` compatible with the dashboard by reporting the number of unique station identities seen/processed in the run. `station_metadata_updated` separately reports how many stations had changed descriptive metadata and therefore required a station metadata write.
 - Inserts `error_logs` row on ingest failure.
 
 The previous proxy worker (Cloud Run -> Supabase Edge function) is archived at:
@@ -64,7 +65,7 @@ The previous proxy worker (Cloud Run -> Supabase Edge function) is archived at:
 - `SCOMM_SOURCE_RETRIES` (default `3`)
 - `SCOMM_UPSERT_CHUNK_SIZE` (default `500`)
 - `SCOMM_TRIGGER_MODE` (default `manual`; set by service wrapper for observability)
-- `OBSERVS_UPSERT_RPC` (default `uk_aq_rpc_observs_observations_upsert`)
+- `OBSERVS_UPSERT_RPC` (default `uk_aq_rpc_observs_observations_compact_upsert_v1`)
 - `OBSERVS_UPSERT_CHUNK_SIZE` (default `5000`)
 - `OBSERVS_WRITE_MODE` (default `outbox_only`; supports `outbox_only`, `direct`, `pubsub_only`)
 - `GCP_OBSERVS_PUBSUB_TOPIC` (required when `OBSERVS_WRITE_MODE=pubsub_only`)
