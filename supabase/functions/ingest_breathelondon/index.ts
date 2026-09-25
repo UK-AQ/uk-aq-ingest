@@ -22,6 +22,13 @@ import {
   serializedJsonUtf8Bytes,
   writeIngestDbObservations,
 } from "../_shared/ingestdb_observation_writer.mjs";
+import {
+  COMMUNITIES_SPECIES_CONFIG,
+  buildCommunitiesPhenomenaRows,
+  buildCommunitiesTimeseriesRows,
+  canonicalCommunitiesMappings,
+  classifyCommunitiesTimeseriesRows,
+} from "../../../shared/blondon_communities_reference.mjs";
 
 configureServiceEgressMetrics("ingest.blondon_communities");
 configureObservsPostgrestFetch(serviceEgressPostgrestFetch);
@@ -147,26 +154,7 @@ const SPECIES_CONFIG: Record<
     observed_property_code: string;
     observed_property_domain: "aq" | "met";
   }
-> = {
-  IPM25: {
-    label: "PM2.5",
-    uom: "ug/m3",
-    source_label: "breathelondon:pm2.5",
-    notation: "PM2.5",
-    pollutant_label: "pm2.5",
-    observed_property_code: "pm25",
-    observed_property_domain: "aq",
-  },
-  INO2: {
-    label: "NO2",
-    uom: "ug/m3",
-    source_label: "breathelondon:no2",
-    notation: "NO2",
-    pollutant_label: "no2",
-    observed_property_code: "no2",
-    observed_property_domain: "aq",
-  },
-};
+> = COMMUNITIES_SPECIES_CONFIG;
 
 const UK_BBOX = {
   west: -11.0,
@@ -909,88 +897,144 @@ async function upsertStationMetadata(
   return rows.length;
 }
 
-async function fetchPhenomenaIds(
+async function fetchCanonicalPhenomenaMappings(
   connectorId: string,
   speciesList: string[],
-): Promise<Record<string, number>> {
+): Promise<{ phenomenonIds: Record<string, number>; observedPropertyIds: Record<string, number> }> {
   if (!speciesList.length) {
-    return {};
+    return { phenomenonIds: {}, observedPropertyIds: {} };
   }
+  const payload = buildCommunitiesPhenomenaRows(Number(connectorId), speciesList);
   const sourceLabels = speciesList.map((species) => SPECIES_CONFIG[species].source_label);
-  const { data, error } = await publicRpcRequest<
-    Array<{ id: number; source_label?: string; eionet_uri?: string }>
-  >(
-    "uk_aq_rpc_phenomena_ids",
-    {
-      connector_id: Number(connectorId),
-      eionet_uris: sourceLabels,
-    },
+  const [phenomenaResult, mappingsResult] = await Promise.all([
+    postgrestRequest<Array<Record<string, unknown>>>("GET", "phenomena", {
+      select: "id,source_label,observed_property_id",
+      connector_id: `eq.${connectorId}`,
+      source_label: postgrestIn(sourceLabels),
+    }),
+    postgrestRequest<Array<Record<string, unknown>>>("GET", "observed_property_mappings", {
+      select: "source_label,observed_property_id,observed_property_code,mapping_kind,is_aqi_eligible,is_active",
+      connector_id: `eq.${connectorId}`,
+      source_label: postgrestIn(sourceLabels),
+    }),
+  ]);
+  if (phenomenaResult.error) {
+    throw new Error(`Phenomena lookup failed: ${phenomenaResult.error.message}`);
+  }
+  if (mappingsResult.error) {
+    throw new Error(`Observed-property mapping lookup failed: ${mappingsResult.error.message}`);
+  }
+  const phenomenaByLabel = new Map(
+    (phenomenaResult.data ?? []).map((row) => [String(row.source_label), row]),
   );
-  if (error) {
-    throw new Error(`Phenomena id lookup failed: ${error.message}`);
-  }
-  const mapping: Record<string, number> = {};
-  for (const row of data ?? []) {
-    const sourceLabel = row.source_label ?? row.eionet_uri;
-    if (sourceLabel) {
-      mapping[String(sourceLabel)] = Number(row.id);
+  const mappingsByLabel = new Map(
+    (mappingsResult.data ?? []).map((row) => [String(row.source_label), row]),
+  );
+  const diagnostics = payload.map((input) => {
+    const phenomenon = phenomenaByLabel.get(input.source_label);
+    const mapping = mappingsByLabel.get(input.source_label);
+    let mappingWarning: string | null = null;
+    if (!mapping) {
+      mappingWarning = "missing_mapping";
+    } else if (mapping.is_active !== true) {
+      mappingWarning = "inactive_mapping";
+    } else if (
+      Number(phenomenon?.observed_property_id)
+        !== Number(mapping.observed_property_id)
+    ) {
+      mappingWarning = "phenomenon_mapping_mismatch";
     }
-  }
-  return mapping;
-}
-
-async function upsertPhenomena(connectorId: string, speciesList: string[]): Promise<Record<string, number>> {
-  const payload = speciesList.map((species) => {
-    const config = SPECIES_CONFIG[species];
     return {
-      connector_id: connectorId,
-      label: config.label,
-      source_label: config.source_label,
-      notation: config.notation,
-      pollutant_label: config.pollutant_label,
-      observed_property_code: config.observed_property_code,
-      observed_property_display_name: config.label,
-      observed_property_domain: config.observed_property_domain,
-      canonical_uom: config.uom,
+      source_label: input.source_label,
+      phenomenon_id: phenomenon?.id,
+      observed_property_id: phenomenon?.observed_property_id,
+      observed_property_code: mapping?.observed_property_code,
+      mapping_kind: mapping?.mapping_kind,
+      is_aqi_eligible: mapping?.is_aqi_eligible,
+      mapping_warning: mappingWarning,
     };
   });
-  const { error } = await publicRpcRequest<Array<{ phenomena_upserted: number }>>(
+  return canonicalCommunitiesMappings(payload, diagnostics);
+}
+
+type CommunitiesTimeseriesRow = Record<string, unknown> & {
+  id: number;
+  timeseries_ref: string;
+};
+
+const COMMUNITIES_TIMESERIES_SELECT = [
+  "id",
+  "connector_id",
+  "station_id",
+  "timeseries_ref",
+  "label",
+  "uom",
+  "service_ref",
+  "phenomenon_id",
+  "observed_property_id",
+  "extras",
+].join(",");
+
+async function fetchTimeseriesRows(
+  connectorId: string,
+  timeseriesRefs: string[],
+): Promise<CommunitiesTimeseriesRow[]> {
+  const refs = timeseriesRefs.filter(Boolean);
+  const rows: CommunitiesTimeseriesRow[] = [];
+  for (let idx = 0; idx < refs.length; idx += 200) {
+    const refsChunk = refs.slice(idx, idx + 200);
+    const { data, error } = await postgrestRequest<CommunitiesTimeseriesRow[]>(
+      "GET",
+      "timeseries",
+      {
+        select: COMMUNITIES_TIMESERIES_SELECT,
+        connector_id: `eq.${connectorId}`,
+        timeseries_ref: postgrestIn(refsChunk),
+      },
+    );
+    if (error) throw new Error(`Timeseries reference lookup failed: ${error.message}`);
+    rows.push(...(data ?? []));
+  }
+  return rows;
+}
+
+async function repairMissingTimeseriesByStation(
+  rows: Record<string, unknown>[],
+  errors: string[],
+): Promise<number> {
+  const byStation = new Map<string, Record<string, unknown>[]>();
+  for (const row of rows) {
+    const extras = row.extras as Record<string, unknown> | undefined;
+    const stationRef = String(extras?.site_code ?? "");
+    const stationRows = byStation.get(stationRef) ?? [];
+    stationRows.push(row);
+    byStation.set(stationRef, stationRows);
+  }
+  for (const [stationRef, stationRows] of byStation) {
+    const { error } = await postgrestRequest(
+      "POST",
+      "timeseries",
+      { on_conflict: "connector_id,timeseries_ref" },
+      stationRows,
+      "resolution=merge-duplicates,return=minimal",
+    );
+    if (error) {
+      errors.push(`reference_repair:${stationRef}:${error.message}`);
+    }
+  }
+  return byStation.size;
+}
+
+async function upsertPhenomena(connectorId: string, speciesList: string[]): Promise<{ phenomenonIds: Record<string, number>; observedPropertyIds: Record<string, number> }> {
+  const payload = buildCommunitiesPhenomenaRows(Number(connectorId), speciesList);
+  const { data, error } = await publicRpcRequest<Array<Record<string, unknown>>>(
     "uk_aq_rpc_phenomena_upsert",
     { rows: payload },
   );
   if (error) {
     throw new Error(`Phenomena upsert failed: ${error.message}`);
   }
-  return await fetchPhenomenaIds(connectorId, speciesList);
-}
-
-async function fetchTimeseriesIds(
-  connectorId: string,
-  serviceRef: string,
-  timeseriesRefs: string[],
-): Promise<Record<string, number>> {
-  const refs = timeseriesRefs.filter(Boolean);
-  if (!refs.length) {
-    return {};
-  }
-  const mapping: Record<string, number> = {};
-  for (let idx = 0; idx < refs.length; idx += 200) {
-    const chunk = refs.slice(idx, idx + 200);
-    const { data } = await postgrestRequest<Array<{ id: number; timeseries_ref: string }>>(
-      "GET",
-      "timeseries",
-      {
-        select: "id,timeseries_ref",
-        connector_id: `eq.${connectorId}`,
-        service_ref: `eq.${serviceRef}`,
-        timeseries_ref: postgrestIn(chunk),
-      },
-    );
-    for (const row of data ?? []) {
-      mapping[String(row.timeseries_ref)] = Number(row.id);
-    }
-  }
-  return mapping;
+  return canonicalCommunitiesMappings(payload, data ?? []);
 }
 
 async function fetchStationCheckpoints(
@@ -2092,8 +2136,8 @@ serve(async (req) => {
               };
             }
           } else {
-              const phenomenonIds = dryRun
-                ? await fetchPhenomenaIds(connector.id, speciesList)
+              const { phenomenonIds, observedPropertyIds } = dryRun
+                ? await fetchCanonicalPhenomenaMappings(connector.id, speciesList)
                 : await upsertPhenomena(connector.id, speciesList);
               const observsRowsPending: ObservsObservationRow[] = [];
               const flushPendingObservsRows = async (
@@ -2135,39 +2179,67 @@ serve(async (req) => {
                 }
               };
 
-              const timeseriesRows: Record<string, unknown>[] = [];
-              for (const row of stationRows) {
-                const stationRef = String(row.station_ref);
-                const stationId = stationIdMap[stationRef];
-                if (!stationId) {
-                  continue;
-                }
-                const stationName = asString(row.station_name) ?? asString(row.label) ?? stationRef;
-                for (const species of speciesList) {
-                  const config = SPECIES_CONFIG[species];
-                  timeseriesRows.push({
-                    timeseries_ref: `${stationRef}:${species}`,
-                    label: `${stationName} ${config.label}`,
-                    uom: config.uom,
-                    station_id: stationId,
-                    service_ref: serviceRef,
-                    connector_id: connector.id,
-                    phenomenon_id: phenomenonIds[config.source_label],
-                    extras: { site_code: stationRef, species },
-                  });
-                }
-              }
-              const timeseriesIdMap = await fetchTimeseriesIds(
+              const referenceStations = stationRows.flatMap((row) => {
+                const stationRef = String(row.station_ref), id = stationIdMap[stationRef];
+                return id ? [{ ...row, id }] : [];
+              });
+              const timeseriesRows = buildCommunitiesTimeseriesRows(referenceStations, {
+                connectorId: Number(connector.id), serviceRef, phenomenonIds,
+                observedPropertyIds, species: speciesList,
+              });
+              const timeseriesRefs = timeseriesRows.map((row) => String(row.timeseries_ref));
+              const beforeRows = await fetchTimeseriesRows(
                 connector.id,
-                serviceRef,
-                timeseriesRows.map((row) => String(row.timeseries_ref)),
+                timeseriesRefs,
               );
-              const missingTimeseriesRefs = timeseriesRows
-                .map((row) => String(row.timeseries_ref))
-                .filter((ref) => !timeseriesIdMap[ref]);
-              if (missingTimeseriesRefs.length) {
+              const before = classifyCommunitiesTimeseriesRows(timeseriesRows, beforeRows);
+              const initiallyMissing = new Set(before.missingRefs);
+              const initiallyMissingRows = timeseriesRows.filter((row) =>
+                initiallyMissing.has(String(row.timeseries_ref))
+              );
+              let referenceRepairAttempts = 0;
+              if (initiallyMissingRows.length && !dryRun) {
+                referenceRepairAttempts = await repairMissingTimeseriesByStation(
+                  initiallyMissingRows,
+                  errors,
+                );
+              }
+              const finalRows = await fetchTimeseriesRows(
+                connector.id,
+                timeseriesRefs,
+              );
+              const stableIds = new Map(
+                beforeRows.map((row) => [String(row.timeseries_ref), Number(row.id)]),
+              );
+              const final = classifyCommunitiesTimeseriesRows(
+                timeseriesRows,
+                finalRows,
+                stableIds,
+              );
+              const timeseriesIdMap = final.validIds;
+              const unresolvedTimeseriesRefs = [
+                ...final.missingRefs,
+                ...final.mismatchedRefs,
+                ...final.changedIdRefs,
+              ].sort();
+              const isolatedStationRefs = [...new Set(unresolvedTimeseriesRefs.map((ref) => ref.slice(0, ref.lastIndexOf(":"))))];
+              const isolatedStations = new Set(isolatedStationRefs);
+              const finalInvalidRefs = new Set(unresolvedTimeseriesRefs);
+              const missingRefsRepaired = before.missingRefs.filter((ref) =>
+                !finalInvalidRefs.has(ref)
+              ).length;
+              if (
+                referenceStations.length
+                && isolatedStations.size >= referenceStations.length
+              ) {
                 throw new Error(
-                  `Missing Communities timeseries identities: ${missingTimeseriesRefs.slice(0, 10).join(",")}`,
+                  "All selected Communities stations have unresolved timeseries identities: "
+                    + unresolvedTimeseriesRefs.slice(0, 10).join(","),
+                );
+              }
+              if (isolatedStations.size) {
+                errors.push(
+                  `reference_resolution:${isolatedStationRefs.join(",")}:${unresolvedTimeseriesRefs.join(",")}`,
                 );
               }
 
@@ -2197,6 +2269,7 @@ serve(async (req) => {
 
               for (const row of stationRows) {
                 const stationRef = String(row.station_ref);
+                if (isolatedStations.has(stationRef)) continue;
                 const stationId = stationIdMap[stationRef];
                 if (!stationId) {
                   continue;
@@ -2422,14 +2495,25 @@ serve(async (req) => {
                 series_polled: seriesPolled,
                 checkpoints_upserted: checkpointsUpserted,
                 dry_run: dryRun,
-                partial: timeBudgetHit,
+                partial: timeBudgetHit || isolatedStations.size > 0,
+                run_status: timeBudgetHit || isolatedStations.size > 0
+                  ? "partial"
+                  : (dryRun ? "dry_run" : "succeeded"),
+                run_message: isolatedStations.size
+                  ? "reference_station_isolation"
+                  : (timeBudgetHit ? "runtime_budget_exceeded" : "ok"),
                 stopped_reason: timeBudgetHit ? "runtime_budget_exceeded" : null,
+                reference_repair_attempts: referenceRepairAttempts,
+                missing_refs_repaired: missingRefsRepaired,
+                isolated_station_count: isolatedStations.size,
+                isolated_station_refs: isolatedStationRefs.slice(0, 100),
+                unresolved_timeseries_refs: unresolvedTimeseriesRefs.slice(0, 200),
                 errors,
               };
               log.info("Stations polled.", {
                 stations_selected: stationsSelected,
                 stations_processed: stationsProcessed,
-                partial: timeBudgetHit,
+                partial: timeBudgetHit || isolatedStations.size > 0,
               });
               if (!dryRun) {
                 const { error: pollUpdateError } = await postgrestRequest(
