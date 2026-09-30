@@ -34,6 +34,7 @@ type PublicNetwork = {
   network_label: string;
   network_type: "official" | "community" | "aggregator";
   public_display_enabled: true;
+  live_map_enabled: boolean;
 };
 
 serve(async (req) => {
@@ -131,7 +132,7 @@ async function loadPublicNetworks(): Promise<PublicNetwork[]> {
   const url = new URL(`${REST_BASE_URL}/networks`);
   url.searchParams.set(
     "select",
-    "network_id,network_code,network_label,network_type,public_display_enabled",
+    "network_id,network_code,network_label,network_type,public_display_enabled,live_map_enabled",
   );
   url.searchParams.set("order", "default_priority.asc,network_label.asc");
 
