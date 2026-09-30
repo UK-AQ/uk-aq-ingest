@@ -192,6 +192,7 @@ export async function reserveOpenaqBudgetViaDatabase(
   await previousReservation;
 
   let timeoutId: number | undefined;
+  const startedAtMs = Date.now();
 
   try {
     const sql = getBudgetDatabaseClient();
@@ -223,6 +224,43 @@ export async function reserveOpenaqBudgetViaDatabase(
     }
     return [row];
   } catch (error) {
+    const errorRecord = error && typeof error === "object"
+      ? error as Record<string, unknown>
+      : null;
+    const cause = errorRecord?.cause;
+    const causeRecord = cause && typeof cause === "object"
+      ? cause as Record<string, unknown>
+      : null;
+    const safeField = (value: unknown, pattern: RegExp): string | null => {
+      if (typeof value !== "string" || !pattern.test(value)) {
+        return null;
+      }
+      return value;
+    };
+
+    console.error(JSON.stringify({
+      severity: "ERROR",
+      message: "OpenAQ shared budget database reservation failed",
+      component: "openaq_budget_database",
+      elapsed_ms: Math.max(0, Date.now() - startedAtMs),
+      error_name: safeField(
+        errorRecord?.name,
+        /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/,
+      ),
+      error_code: safeField(
+        errorRecord?.code,
+        /^[A-Za-z0-9_.-]{1,63}$/,
+      ),
+      cause_name: safeField(
+        causeRecord?.name,
+        /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/,
+      ),
+      cause_code: safeField(
+        causeRecord?.code,
+        /^[A-Za-z0-9_.-]{1,63}$/,
+      ),
+    }));
+
     await closeFailedBudgetDatabaseClient();
     throw boundedDatabaseError(error);
   } finally {
