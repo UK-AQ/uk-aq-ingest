@@ -50,7 +50,7 @@ const DEFAULT_TIMESERIES_LIMIT = parsePositiveInt(
 );
 const DEFAULT_STATION_BATCH_LIMIT = parsePositiveInt(
   Deno.env.get("SOS_STATION_BATCH_LIMIT"),
-  100,
+  1000,
 );
 const DEFAULT_STALE_LIMIT = parsePositiveInt(
   Deno.env.get("SOS_STALE_LIMIT"),
@@ -137,7 +137,6 @@ type StationCheckpointRow = {
   next_due_at: string | null;
   last_observed_at: string | null;
   ingest_lag_samples: number[];
-  last_polled_at: string | null;
 };
 
 function requiredEnv(name: string): string {
@@ -322,11 +321,7 @@ function getTimeseriesLimit(connector: ConnectorConfig | null): number {
   return DEFAULT_TIMESERIES_LIMIT;
 }
 
-function getStationBatchLimit(connector: ConnectorConfig | null): number {
-  const value = toPositiveIntegerOrNull(connector?.poll_timeseries_batch_size);
-  if (value !== null) {
-    return value;
-  }
+function getStationBatchLimit(): number {
   return DEFAULT_STATION_BATCH_LIMIT;
 }
 
@@ -440,42 +435,6 @@ async function loadSelectedWork(params: {
     );
   }
   return normalizeSosSelectedWorkRpcResponse(response.data);
-}
-
-async function recordStationAttempts(
-  timeseriesRows: SelectedTimeseriesRow[],
-  attemptedAtIso: string,
-): Promise<number> {
-  const stationIds = [...new Set(timeseriesRows.map((row) => row.station_id))]
-    .sort((a, b) => a - b);
-  if (!stationIds.length) {
-    return 0;
-  }
-
-  const response = await postgrestRequest(
-    "POST",
-    "rpc/sos_record_station_attempts",
-    {
-      schema: UK_AQ_CORE_SCHEMA,
-      body: {
-        p_station_ids: stationIds,
-        p_attempted_at: attemptedAtIso,
-      },
-    },
-  );
-  if (!response.ok) {
-    throw new Error(
-      `Failed to record SOS station attempts (${response.status}): ${response.text}`,
-    );
-  }
-
-  const recorded = toIntegerOrNull(response.data);
-  if (recorded !== stationIds.length) {
-    throw new Error(
-      `SOS station attempt count mismatch: expected ${stationIds.length}, recorded ${recorded}`,
-    );
-  }
-  return recorded;
 }
 
 async function loadSuccessfullyPolledTimeseriesIds(
@@ -602,6 +561,64 @@ async function loadStationLatestObserved(
   return latestByStation;
 }
 
+async function loadSuccessfulTimeseriesLatestObservedByStation(
+  connectorId: number,
+  timeseriesRows: SelectedTimeseriesRow[],
+): Promise<Map<number, string>> {
+  const latestByStation = new Map<number, string>();
+  if (!timeseriesRows.length) {
+    return latestByStation;
+  }
+
+  const expectedStationByTimeseriesId = new Map(
+    timeseriesRows.map((row) => [row.id, row.station_id]),
+  );
+  let offset = 0;
+  const limit = 1000;
+  while (true) {
+    const response = await postgrestRequest("GET", "timeseries", {
+      query: {
+        select: "id,station_id,last_value_at",
+        connector_id: `eq.${connectorId}`,
+        id: postgrestIn(timeseriesRows.map((row) => row.id)),
+        ended_at: "is.null",
+        last_value_at: "not.is.null",
+        order: "id.asc",
+        limit: String(limit),
+        offset: String(offset),
+      },
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Failed to load successful SOS timeseries latest observed (${response.status}): ${response.text}`,
+      );
+    }
+    const rows = Array.isArray(response.data) ? response.data : [];
+    for (const row of rows) {
+      const obj = toObject(row);
+      const timeseriesId = toIntegerOrNull(obj?.id);
+      const stationId = toIntegerOrNull(obj?.station_id);
+      const observedAt = toStringOrNull(obj?.last_value_at);
+      if (
+        timeseriesId === null || stationId === null || !observedAt ||
+        expectedStationByTimeseriesId.get(timeseriesId) !== stationId
+      ) {
+        continue;
+      }
+      const current = latestByStation.get(stationId);
+      if (!current || Date.parse(observedAt) > Date.parse(current)) {
+        latestByStation.set(stationId, observedAt);
+      }
+    }
+    if (rows.length < limit) {
+      break;
+    }
+    offset += limit;
+  }
+
+  return latestByStation;
+}
+
 async function loadStationCheckpointRows(
   stationIds: number[],
 ): Promise<Map<number, StationCheckpointRow>> {
@@ -620,7 +637,7 @@ async function loadStationCheckpointRows(
         schema: UK_AQ_RAW_SCHEMA,
         query: {
           select:
-            "station_id,next_due_at,last_observed_at,ingest_lag_samples,last_polled_at",
+            "station_id,next_due_at,last_observed_at,ingest_lag_samples",
           station_id: postgrestIn(stationIds),
           order: "station_id.asc",
           limit: String(limit),
@@ -653,7 +670,6 @@ async function loadStationCheckpointRows(
         next_due_at: toStringOrNull(obj?.next_due_at),
         last_observed_at: toStringOrNull(obj?.last_observed_at),
         ingest_lag_samples: lagSamples,
-        last_polled_at: toStringOrNull(obj?.last_polled_at),
       });
     }
     if (rows.length < limit) {
@@ -692,7 +708,8 @@ function maxTimestampIso(a: string | null, b: string | null): string | null {
 
 function buildStationCheckpointRows(
   stationRows: StationRow[],
-  latestByStation: Map<number, string>,
+  preRunLatestByStation: Map<number, string>,
+  postRunLatestByStation: Map<number, string>,
   checkpointByStation: Map<number, StationCheckpointRow>,
   now: Date,
 ): Array<Record<string, unknown>> {
@@ -700,12 +717,22 @@ function buildStationCheckpointRows(
   return stationRows.map((station) => {
     const current = checkpointByStation.get(station.id);
     const previousLastObserved = current?.last_observed_at ?? null;
-    const latestObserved = latestByStation.get(station.id) ?? null;
-    const updatedLastObserved = maxTimestampIso(previousLastObserved, latestObserved);
-    const stationHasNewObservation = Boolean(
-      latestObserved &&
-      (!previousLastObserved || Date.parse(latestObserved) > Date.parse(previousLastObserved)),
+    const preRunLatestObserved = preRunLatestByStation.get(station.id) ?? null;
+    const postRunLatestObserved = postRunLatestByStation.get(station.id) ??
+      null;
+    const authoritativePreRunObserved = maxTimestampIso(
+      previousLastObserved,
+      preRunLatestObserved,
     );
+    const stationHasNewObservation = Boolean(
+      postRunLatestObserved &&
+        (!authoritativePreRunObserved ||
+          Date.parse(postRunLatestObserved) >
+            Date.parse(authoritativePreRunObserved)),
+    );
+    const updatedLastObserved = stationHasNewObservation
+      ? maxTimestampIso(previousLastObserved, postRunLatestObserved)
+      : previousLastObserved;
 
     let lagSamples = current?.ingest_lag_samples ?? [];
     let nextDueAt = current?.next_due_at ?? null;
@@ -719,9 +746,11 @@ function buildStationCheckpointRows(
         lagSamples = appendSample(lagSamples, lagSeconds);
       }
       if (lagSamples.length < 10) {
-        nextDueAt = new Date(now.getTime() + CHECKPOINT_WARMUP_SECONDS * 1000).toISOString();
+        nextDueAt = new Date(now.getTime() + CHECKPOINT_WARMUP_SECONDS * 1000)
+          .toISOString();
       } else {
-        const lagSecondsMin = minSeconds(lagSamples) ?? CHECKPOINT_WARMUP_SECONDS;
+        const lagSecondsMin = minSeconds(lagSamples) ??
+          CHECKPOINT_WARMUP_SECONDS;
         const baseMs = Date.parse(updatedLastObserved);
         if (Number.isFinite(baseMs)) {
           nextDueAt = new Date(
@@ -732,12 +761,16 @@ function buildStationCheckpointRows(
         }
       }
     } else if (!nextDueAt) {
-      if (updatedLastObserved && Number.isFinite(Date.parse(updatedLastObserved))) {
+      if (
+        updatedLastObserved && Number.isFinite(Date.parse(updatedLastObserved))
+      ) {
         nextDueAt = new Date(
-          Date.parse(updatedLastObserved) + CHECKPOINT_BASE_PERIOD_SECONDS * 1000,
+          Date.parse(updatedLastObserved) +
+            CHECKPOINT_BASE_PERIOD_SECONDS * 1000,
         ).toISOString();
       } else {
-        nextDueAt = new Date(now.getTime() + CHECKPOINT_WARMUP_SECONDS * 1000).toISOString();
+        nextDueAt = new Date(now.getTime() + CHECKPOINT_WARMUP_SECONDS * 1000)
+          .toISOString();
       }
     }
 
@@ -746,7 +779,6 @@ function buildStationCheckpointRows(
       next_due_at: nextDueAt,
       last_observed_at: updatedLastObserved,
       ingest_lag_samples: lagSamples,
-      last_polled_at: nowIso,
       updated_at: nowIso,
     };
   });
@@ -790,12 +822,15 @@ async function buildIngestPayload(
   const payload: Record<string, unknown> = {
     ...REQUEST_PAYLOAD_OVERRIDES,
   };
-  const connectorCode = toStringOrNull(payload.connector_code) || CONNECTOR_CODE;
+  const connectorCode = toStringOrNull(payload.connector_code) ||
+    CONNECTOR_CODE;
   const windowHours = getWindowHours(connector);
   const timeseriesLimit = getTimeseriesLimit(connector);
   const stationBatchLimit =
-    toPositiveIntegerOrNull(payload.station_batch_limit) ?? getStationBatchLimit(connector);
-  const staleLimit = toPositiveIntegerOrNull(payload.stale_limit) ?? DEFAULT_STALE_LIMIT;
+    toPositiveIntegerOrNull(payload.station_batch_limit) ??
+      getStationBatchLimit();
+  const staleLimit = toPositiveIntegerOrNull(payload.stale_limit) ??
+    DEFAULT_STALE_LIMIT;
   const bridgeDayUtc = new Date().toISOString().slice(0, 10);
   const selectedWork = await loadSelectedWork({
     batchLimit: stationBatchLimit,
@@ -978,7 +1013,6 @@ async function insertRunRow(
   runMessage: string,
   ingestResponse: IngestResponse,
   payload: Record<string, unknown> | null,
-  stationsFallback: number | null,
   lastObservedFallback: string | null,
 ): Promise<void> {
   const row = {
@@ -991,9 +1025,7 @@ async function insertRunRow(
     last_observed_at: toStringOrNull(payload?.last_observed_at) ||
       toStringOrNull(payload?.last_observed) ||
       lastObservedFallback,
-    stations_updated: toIntegerOrNull(payload?.stations_updated) ??
-      toIntegerOrNull(payload?.stations) ??
-      stationsFallback,
+    stations_updated: toIntegerOrNull(payload?.stations_updated),
     observations_upserted: toIntegerOrNull(payload?.observations_upserted) ??
       toIntegerOrNull(payload?.observations),
     timeseries_updated: toIntegerOrNull(payload?.timeseries_updated) ??
@@ -1179,6 +1211,7 @@ async function recordSkippedRun(
   connectorId: number,
   runStartedAtIso: string,
   runMessage: string,
+  stationsSelected: number,
 ): Promise<void> {
   const runEndedAtIso = new Date().toISOString();
   const runStatus = "skipped";
@@ -1189,6 +1222,9 @@ async function recordSkippedRun(
       run_status: runStatus,
       run_message: runMessage,
       connector_code: CONNECTOR_CODE,
+      stations_selected: stationsSelected,
+      stations_attempted: 0,
+      stations_polled: 0,
     },
     raw: "",
   };
@@ -1207,7 +1243,6 @@ async function recordSkippedRun(
     runMessage,
     ingestResponse,
     toObject(ingestResponse.body),
-    null,
     null,
   );
 }
@@ -1264,7 +1299,12 @@ async function main(): Promise<void> {
     const payloadPlan = await buildIngestPayload(connector);
 
     if (!payloadPlan.stationRows.length) {
-      await recordSkippedRun(connectorId, runStartedAtIso, "no_station_refs");
+      await recordSkippedRun(
+        connectorId,
+        runStartedAtIso,
+        "no_station_refs",
+        0,
+      );
       await writeChildResult(
         buildSosCloudRunSkippedResult("no_station_refs", connectorId),
       );
@@ -1278,9 +1318,22 @@ async function main(): Promise<void> {
     }
 
     if (!payloadPlan.timeseriesIds.length) {
-      await recordSkippedRun(connectorId, runStartedAtIso, "no_timeseries_ids");
+      await recordSkippedRun(
+        connectorId,
+        runStartedAtIso,
+        "no_timeseries_ids",
+        payloadPlan.stationRows.length,
+      );
       await writeChildResult(
-        buildSosCloudRunSkippedResult("no_timeseries_ids", connectorId),
+        buildSosCloudRunSkippedResult(
+          "no_timeseries_ids",
+          connectorId,
+          {
+            stationsSelected: payloadPlan.stationRows.length,
+            stationsAttempted: 0,
+            stationsPolled: 0,
+          },
+        ),
       );
       logSummary("skipped", {
         reason: "no_timeseries_ids",
@@ -1301,6 +1354,16 @@ async function main(): Promise<void> {
       timeseries_selected: payloadPlan.timeseriesIds.length,
     });
 
+    const selectedStationIds = [
+      ...new Set(
+        payloadPlan.timeseriesRows.map((row) => row.station_id),
+      ),
+    ].sort((a, b) => a - b);
+    const preRunLatestByStation = await loadStationLatestObserved(
+      connectorId,
+      selectedStationIds,
+    );
+
     server = new Deno.Command("deno", {
       args: [
         "run",
@@ -1319,19 +1382,62 @@ async function main(): Promise<void> {
     }).spawn();
 
     await waitForServer(`http://127.0.0.1:${PORT}/`);
-    const attemptedAtIso = new Date().toISOString();
-    const stationsAttempted = await recordStationAttempts(
-      payloadPlan.timeseriesRows,
-      attemptedAtIso,
-    );
-    logSummary("attempts_recorded", {
-      connector_id: connectorId,
-      stations_attempted: stationsAttempted,
-      attempted_at: attemptedAtIso,
-    });
     ingestResponse = await runIngestOnce(payloadPlan.payload);
 
     const { runStatus, runMessage, payload } = deriveRunSummary(ingestResponse);
+    if (!payload) {
+      throw new Error("Malformed SOS ingest response.");
+    }
+    const recognizedDependencyFailure = isRecognizedSosDependencyFailure(
+      ingestResponse,
+    );
+    const runEndedAtIso = new Date().toISOString();
+    const successfullyPolledTimeseriesIds =
+      await loadSuccessfullyPolledTimeseriesIds(
+        payloadPlan.timeseriesIds,
+        runStartedAtIso,
+      );
+    const successfullyPolledStationIds = new Set(
+      payloadPlan.timeseriesRows
+        .filter((row) => successfullyPolledTimeseriesIds.has(row.id))
+        .map((row) => row.station_id),
+    );
+    const successfullyPolledTimeseriesRows = payloadPlan.timeseriesRows.filter(
+      (row) => successfullyPolledTimeseriesIds.has(row.id),
+    );
+    const successfullyPolledStationRows = payloadPlan.stationRows.filter(
+      (station) => successfullyPolledStationIds.has(station.id),
+    );
+    payload.stations_selected = payloadPlan.stationRows.length;
+    payload.stations_polled = successfullyPolledStationIds.size;
+
+    const maxTimeseriesLastObservedAt = await fetchMaxTimeseriesLastValueAt(
+      payloadPlan.timeseriesIds,
+    );
+
+    if (
+      (runStatus === "succeeded" || runStatus === "partial") &&
+      successfullyPolledStationRows.length
+    ) {
+      const checkpointNow = new Date();
+      const postRunLatestByStation =
+        await loadSuccessfulTimeseriesLatestObservedByStation(
+          connectorId,
+          successfullyPolledTimeseriesRows,
+        );
+      const checkpointByStation = await loadStationCheckpointRows(
+        successfullyPolledStationRows.map((row) => row.id),
+      );
+      const checkpointRows = buildStationCheckpointRows(
+        successfullyPolledStationRows,
+        preRunLatestByStation,
+        postRunLatestByStation,
+        checkpointByStation,
+        checkpointNow,
+      );
+      await upsertStationCheckpoints(checkpointRows);
+    }
+
     const childResult = buildSosCloudRunChildResult(
       ingestResponse,
       runStatus,
@@ -1339,49 +1445,6 @@ async function main(): Promise<void> {
     );
     if (!childResult) {
       throw new Error("Malformed SOS ingest response.");
-    }
-    const recognizedDependencyFailure = isRecognizedSosDependencyFailure(
-      ingestResponse,
-    );
-    const runEndedAtIso = new Date().toISOString();
-    const maxTimeseriesLastObservedAt = await fetchMaxTimeseriesLastValueAt(
-      payloadPlan.timeseriesIds,
-    );
-
-    if ((runStatus === "succeeded" || runStatus === "partial") && payloadPlan.stationRows.length) {
-      const checkpointNow = new Date();
-      const latestByStation = await loadStationLatestObserved(
-        connectorId,
-        payloadPlan.stationRows.map((row) => row.id),
-      );
-      const checkpointByStation = await loadStationCheckpointRows(
-        payloadPlan.stationRows.map((row) => row.id),
-      );
-      const recoveredFallback =
-        toStringOrNull(payload?.upstream_failure_kind) !== null;
-      let checkpointStationRows = payloadPlan.stationRows;
-      if (recoveredFallback) {
-        const successfullyPolledTimeseriesIds =
-          await loadSuccessfullyPolledTimeseriesIds(
-            payloadPlan.timeseriesIds,
-            runStartedAtIso,
-          );
-        const successfullyPolledStationIds = new Set(
-          payloadPlan.timeseriesRows
-            .filter((row) => successfullyPolledTimeseriesIds.has(row.id))
-            .map((row) => row.station_id),
-        );
-        checkpointStationRows = payloadPlan.stationRows.filter((station) =>
-          successfullyPolledStationIds.has(station.id)
-        );
-      }
-      const checkpointRows = buildStationCheckpointRows(
-        checkpointStationRows,
-        latestByStation,
-        checkpointByStation,
-        checkpointNow,
-      );
-      await upsertStationCheckpoints(checkpointRows);
     }
 
     await updateConnectorRun(
@@ -1400,7 +1463,6 @@ async function main(): Promise<void> {
       runMessage,
       ingestResponse,
       payload,
-      payloadPlan.stationRows.length,
       maxTimeseriesLastObservedAt,
     );
 
@@ -1419,6 +1481,8 @@ async function main(): Promise<void> {
       response_status: ingestResponse.status,
       connector_id: connectorId,
       stations_selected: payloadPlan.stationRows.length,
+      stations_attempted: toIntegerOrNull(payload.stations_attempted),
+      stations_polled: successfullyPolledStationIds.size,
       series_polled: toIntegerOrNull(payload?.series_polled),
       observations_upserted: toIntegerOrNull(payload?.observations_upserted),
       partial: payload?.partial === true,

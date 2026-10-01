@@ -99,6 +99,9 @@ function timestampString(value: unknown): string | null {
 }
 
 function finiteInteger(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
     return null;

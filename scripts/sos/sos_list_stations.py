@@ -36,6 +36,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.ingest_helpers import station_coords, station_in_bbox_or_missing_coords
+from scripts.sos.sos_failure_classification import (
+    SOS_UPSTREAM_UNAVAILABLE_EXIT_CODE,
+    SosUpstreamUnavailableError,
+    raise_for_retry_exhausted_status,
+    raise_for_retry_exhausted_transport,
+)
 from scripts.uk_aq_supabase import SupabaseSchemas, create_supabase_client
 from scripts.uk_aq_phenomena_rpc import upsert_phenomena_via_rpc
 load_dotenv()
@@ -244,24 +250,68 @@ class UkAirClient:
 
     def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         url = f"{self.base_url}/{path.lstrip('/')}"
+        request_label = self._request_label(path, params)
         for attempt in range(1, self.retries + 1):
             try:
                 resp = self.session.get(url, params=params, timeout=self.timeout)
-                if resp.status_code in (429, 500, 502, 503, 504):
-                    self._sleep(attempt)
+            except requests.RequestException as exc:
+                failure = f"{type(exc).__name__} {request_label}: {exc}"
+                if self._retry_failed(attempt, failure):
                     continue
+                raise_for_retry_exhausted_transport(exc, request_label)
+
+            if resp.status_code in (429, 500, 502, 503, 504):
+                failure = f"HTTP {resp.status_code} {request_label}"
+                if self._retry_failed(attempt, failure):
+                    continue
+                raise_for_retry_exhausted_status(resp.status_code, request_label)
+
+            try:
                 resp.raise_for_status()
                 return resp.json()
             except requests.RequestException as exc:
-                LOG.warning("Request failed (attempt %s/%s): %s", attempt, self.retries, exc)
-                if attempt == self.retries:
-                    raise
-                self._sleep(attempt)
-        return []
+                failure = f"{type(exc).__name__} {request_label}: {exc}"
+                if self._retry_failed(attempt, failure):
+                    continue
+                raise
+        raise RuntimeError(
+            f"UK-AIR SOS request ended without a response after {self.retries} attempts: "
+            f"{request_label}"
+        )
+
+    def _retry_delay(self, attempt: int) -> int:
+        return min(30, 2**attempt)
+
+    def _retry_failed(self, attempt: int, failure: str) -> bool:
+        if attempt == self.retries:
+            LOG.error(
+                "Request failed (attempt %s/%s): %s; retries exhausted.",
+                attempt,
+                self.retries,
+                failure,
+            )
+            return False
+        delay = self._retry_delay(attempt)
+        LOG.warning(
+            "Request failed (attempt %s/%s): %s; retrying in %ss.",
+            attempt,
+            self.retries,
+            failure,
+            delay,
+        )
+        self._sleep(attempt)
+        return True
 
     def _sleep(self, attempt: int) -> None:
-        delay = min(30, 2**attempt)
-        time.sleep(delay)
+        time.sleep(self._retry_delay(attempt))
+
+    def _request_label(self, path: str, params: Optional[Dict[str, Any]]) -> str:
+        if not params:
+            return path
+        station_list = params.get("station") if isinstance(params, dict) else None
+        if isinstance(station_list, list):
+            return f"{path} (stations={len(station_list)})"
+        return f"{path} (params={','.join(sorted(params.keys()))})"
 
     def stations(self) -> List[Dict[str, Any]]:
         params_options: List[Optional[Dict[str, Any]]] = [{"expanded": "true"}, None]
@@ -1367,6 +1417,8 @@ def main() -> None:
     run_at = utcnow()
     client = UkAirClient()
     services = client.services()
+    if not services:
+        raise RuntimeError("No services returned from UK-AIR SOS.")
     primary_service = _select_primary_service(services)
     default_service_ref = None
     if primary_service and primary_service.get("id") is not None:
@@ -1591,4 +1643,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SosUpstreamUnavailableError as exc:
+        LOG.error("%s", exc)
+        raise SystemExit(SOS_UPSTREAM_UNAVAILABLE_EXIT_CODE) from exc

@@ -1,4 +1,15 @@
+import { pathToFileURL } from "node:url";
+
 const RPC_SCHEMA = "uk_aq_public";
+const SUPABASE_RETRY_MAX_ATTEMPTS = 3;
+const SUPABASE_RETRY_DELAYS_MS = [250, 500];
+const SUPABASE_TRANSIENT_STATUS_CODES = new Set([502, 503, 504]);
+const MAX_SUPPLEMENTAL_SUMMARY_BYTES = 64 * 1024;
+const RETRY_SAFE_HEALTH_RPCS = new Set([
+  "uk_aq_rpc_daily_task_finished",
+  "uk_aq_rpc_daily_task_failed",
+  "uk_aq_rpc_recompute_daily_task_status",
+]);
 
 function parseBoolean(raw, fallback = false) {
   if (raw === undefined || raw === null || raw === "") {
@@ -60,31 +71,94 @@ async function writeGithubOutputs(values) {
   await fs.appendFile(outputFile, `${lines.join("\n")}\n`, { encoding: "utf-8" });
 }
 
-async function readResponseText(response, limit = 2000) {
-  const text = await response.text();
-  return text.length <= limit ? text : `${text.slice(0, limit - 3)}...`;
+export function isTransientSupabaseError(error) {
+  const status = Number(error?.status ?? error?.statusCode ?? error?.response?.status);
+  if (SUPABASE_TRANSIENT_STATUS_CODES.has(status)) {
+    return true;
+  }
+  const causeCode = String(error?.cause?.code || "").toUpperCase();
+  if ([
+    "ECONNRESET",
+    "ECONNREFUSED",
+    "ENOTFOUND",
+    "EPIPE",
+    "ETIMEDOUT",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+    "UND_ERR_SOCKET",
+  ].includes(causeCode)) {
+    return true;
+  }
+  const name = String(error?.name || "").toLowerCase();
+  const message = String(error?.message || "").toLowerCase();
+  return name === "aborterror" || message.includes("timed out");
 }
 
-async function postRpc({ supabaseUrl, serviceRoleKey, rpcName, body }) {
-  const response = await fetch(`${supabaseUrl}/rest/v1/rpc/${rpcName}`, {
-    method: "POST",
-    headers: {
-      apikey: serviceRoleKey,
-      Authorization: `Bearer ${serviceRoleKey}`,
-      "Content-Type": "application/json",
-      "Accept-Profile": RPC_SCHEMA,
-      "Content-Profile": RPC_SCHEMA,
-    },
-    body: JSON.stringify(body),
-  });
+export function isRetrySafeHealthRpc(rpcName) {
+  return RETRY_SAFE_HEALTH_RPCS.has(rpcName);
+}
 
-  if (!response.ok) {
-    const text = await readResponseText(response);
-    throw new Error(`RPC ${rpcName} failed (${response.status}): ${text}`);
+function defaultSleep(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+export async function retrySupabaseOperation(operationName, operation, {
+  sleep = defaultSleep,
+  logger = console,
+} = {}) {
+  for (let attempt = 1; attempt <= SUPABASE_RETRY_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isTransientSupabaseError(error) || attempt === SUPABASE_RETRY_MAX_ATTEMPTS) {
+        throw error;
+      }
+      const delayMs = SUPABASE_RETRY_DELAYS_MS[attempt - 1];
+      const status = Number(error?.status ?? error?.statusCode ?? error?.response?.status);
+      const reason = SUPABASE_TRANSIENT_STATUS_CODES.has(status)
+        ? `HTTP ${status}`
+        : error?.cause?.code || error?.name || "connection failure";
+      logger.warn(
+        `Retrying Supabase ${operationName} after transient ${reason} `
+        + `(attempt ${attempt + 1}/${SUPABASE_RETRY_MAX_ATTEMPTS}; waiting ${delayMs}ms).`,
+      );
+      await sleep(delayMs);
+    }
   }
+  throw new Error("Unreachable Supabase retry state.");
+}
 
-  const text = await response.text();
-  return text.trim() ? JSON.parse(text) : null;
+export async function postRpc(
+  { supabaseUrl, serviceRoleKey, rpcName, body },
+  { fetchImpl = fetch, sleep, logger } = {},
+) {
+  const request = async () => {
+    const response = await fetchImpl(`${supabaseUrl}/rest/v1/rpc/${rpcName}`, {
+      method: "POST",
+      headers: {
+        apikey: serviceRoleKey,
+        Authorization: `Bearer ${serviceRoleKey}`,
+        "Content-Type": "application/json",
+        "Accept-Profile": RPC_SCHEMA,
+        "Content-Profile": RPC_SCHEMA,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const error = new Error(`RPC ${rpcName} failed (${response.status}).`);
+      error.status = response.status;
+      throw error;
+    }
+
+    const text = await response.text();
+    return text.trim() ? JSON.parse(text) : null;
+  };
+  if (!isRetrySafeHealthRpc(rpcName)) {
+    return request();
+  }
+  return retrySupabaseOperation(`RPC ${rpcName}`, request, { sleep, logger });
 }
 
 function mapJobStatus(jobStatus) {
@@ -115,6 +189,62 @@ function buildSummary(jobStatus) {
     job_status: jobStatus || null,
     trigger: "github_actions",
   };
+}
+
+async function mergeSupplementalSummary(summary, logger = console) {
+  const file = optionalEnv("DAILY_TASK_HEALTH_SUPPLEMENTAL_SUMMARY_FILE");
+  if (!file) {
+    return summary;
+  }
+
+  let handle;
+  try {
+    const fs = await import("node:fs/promises");
+    handle = await fs.open(file, "r");
+    const stats = await handle.stat();
+    if (!stats.isFile() || stats.size > MAX_SUPPLEMENTAL_SUMMARY_BYTES) {
+      throw new Error("supplemental summary must be a file no larger than 64 KiB");
+    }
+
+    const contents = await handle.readFile("utf-8");
+    if (Buffer.byteLength(contents, "utf-8") > MAX_SUPPLEMENTAL_SUMMARY_BYTES) {
+      throw new Error("supplemental summary must be a file no larger than 64 KiB");
+    }
+    const supplemental = JSON.parse(contents);
+    if (supplemental === null || Array.isArray(supplemental) || typeof supplemental !== "object") {
+      throw new Error("supplemental summary must contain a top-level JSON object");
+    }
+
+    const merged = { ...summary };
+    const reservedFields = [];
+    for (const [key, value] of Object.entries(supplemental)) {
+      const isUnsafeKey = ["__proto__", "constructor", "prototype"].includes(key);
+      if (Object.hasOwn(summary, key) || isUnsafeKey) {
+        reservedFields.push(key);
+      } else {
+        merged[key] = value;
+      }
+    }
+    if (reservedFields.length > 0) {
+      logger.warn(
+        `Daily task health supplemental summary ignored reserved fields: ${reservedFields.join(", ")}.`,
+      );
+    }
+    return merged;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    logger.warn(`Daily task health supplemental summary warning: ${reason}. Ignoring file.`);
+    return summary;
+  } finally {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        logger.warn(`Daily task health supplemental summary close warning: ${reason}.`);
+      }
+    }
+  }
 }
 
 function stripUndefined(input) {
@@ -177,10 +307,11 @@ async function main() {
     const jobStatus = requiredEnv("JOB_STATUS");
     const status = mapJobStatus(jobStatus);
     const healthRunId = optionalEnv("DAILY_TASK_HEALTH_RUN_ID");
+    const summary = await mergeSupplementalSummary(buildSummary(jobStatus));
 
     if (healthRunId) {
       const payload = stripUndefined({
-        summary: buildSummary(jobStatus),
+        summary,
         finished_at: status === "Finished" ? now : undefined,
         failed_at: status === "Failed" ? now : undefined,
         error_message: status === "Failed"
@@ -223,7 +354,7 @@ async function main() {
         started_at: optionalEnv("DAILY_TASK_STARTED_AT") || undefined,
         finished_at: status === "Finished" ? now : undefined,
         failed_at: status === "Failed" ? now : undefined,
-        summary: buildSummary(jobStatus),
+        summary,
         error_message: status === "Failed"
           ? `GitHub Actions job ended with status: ${jobStatus}`
           : undefined,
@@ -269,4 +400,6 @@ async function main() {
   }
 }
 
-await main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main();
+}

@@ -26,6 +26,9 @@ const RESPONSE_KEYS = [
   "runtime_deadline_failure_count",
   "runtime_deadline_timeseries_sample",
   "individual_error_count",
+  "stations_selected",
+  "stations_attempted",
+  "stations_polled",
   "series_polled",
   "observations_upserted",
   "connector_id",
@@ -130,6 +133,9 @@ function isValidChildPayload(payload: Record<string, unknown>): boolean {
     const key of [
       "runtime_deadline_failure_count",
       "individual_error_count",
+      "stations_selected",
+      "stations_attempted",
+      "stations_polled",
       "series_polled",
       "observations_upserted",
     ]
@@ -246,6 +252,15 @@ export function buildSosCloudRunChildResult(
 export function buildSosCloudRunSkippedResult(
   reason: string,
   connectorId: number | null = null,
+  stationMetrics: {
+    stationsSelected: number;
+    stationsAttempted: number;
+    stationsPolled: number;
+  } = {
+    stationsSelected: 0,
+    stationsAttempted: 0,
+    stationsPolled: 0,
+  },
 ): SosCloudRunChildResult {
   const safeReason = asBoundedString(reason, 128) ?? "skipped";
   const payload: Record<string, unknown> = {
@@ -254,6 +269,9 @@ export function buildSosCloudRunSkippedResult(
     run_status: "skipped",
     run_message: safeReason,
     reason: safeReason,
+    stations_selected: stationMetrics.stationsSelected,
+    stations_attempted: stationMetrics.stationsAttempted,
+    stations_polled: stationMetrics.stationsPolled,
   };
   if (connectorId !== null && isNonNegativeInteger(connectorId)) {
     payload.connector_id = connectorId;
