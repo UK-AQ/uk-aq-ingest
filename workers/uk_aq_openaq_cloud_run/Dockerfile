@@ -1,4 +1,4 @@
-FROM denoland/deno:2.1.4
+FROM denoland/deno:2.5.0
 
 WORKDIR /app
 
@@ -23,7 +23,7 @@ COPY supabase/functions/_shared/egress_metrics.ts /app/supabase/functions/_share
 
 ENV PORT=8000
 ENV OPENAQ_LOCAL_PORT=8000
-ENV OPENAQ_SHARED_BUDGET_TRANSPORT=postgrest
+ENV OPENAQ_SHARED_BUDGET_TRANSPORT=database
 
 RUN deno cache \
   --config=/app/deno.json \
