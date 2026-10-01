@@ -54,7 +54,7 @@ dry_run = false
 notes = "Sensor.Community ingest trigger"
 
 [jobs.uk_aq_sos]
-enabled = true
+enabled = false
 cron_expr = "*/15 * * * *"
 target_type = "cloud_run"
 cloud_run_url_managed_by_deploy = true
