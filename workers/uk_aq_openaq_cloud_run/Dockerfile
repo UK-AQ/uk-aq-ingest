@@ -23,7 +23,7 @@ COPY supabase/functions/_shared/egress_metrics.ts /app/supabase/functions/_share
 
 ENV PORT=8000
 ENV OPENAQ_LOCAL_PORT=8000
-ENV OPENAQ_SHARED_BUDGET_TRANSPORT=database
+ENV OPENAQ_SHARED_BUDGET_TRANSPORT=postgrest
 
 RUN deno cache \
   --config=/app/deno.json \
