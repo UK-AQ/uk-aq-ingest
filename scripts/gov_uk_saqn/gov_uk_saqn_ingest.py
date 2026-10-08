@@ -10,4 +10,4 @@ from scripts.official_networks.official_network_ingest import main
 
 
 if __name__ == "__main__":
-    raise SystemExit(main("waqn"))
+    raise SystemExit(main("saqn"))

@@ -55,7 +55,7 @@ jobs:
       - name: Install dependencies
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install requests python-dotenv supabase pyproj psycopg2-binary
+          python3 -m pip install requests python-dotenv supabase pyproj psycopg2-binary pandas pyreadr
 
       - name: Validate SUPABASE_DB_URL for pooler
         env:
@@ -291,7 +291,14 @@ jobs:
           echo "ERROR: UK-AIR SOS timeseries discovery failed for a non-isolated reason."
           exit 1
 
-# UK-AIR Black Carbon reference refresh remains TEST-only for now.
+      - name: Refresh UK-AIR Black Carbon reference metadata
+        if: always() && job.status == 'success'
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+          UKAIR_BC_SITE_SEARCH_URL: ${{ vars.UKAIR_BC_SITE_SEARCH_URL }}
+        run: |
+          python3 scripts/ukair_bc/ukair_bc_reference_refresh.py --to-supabase
 
       - name: Sync Breathe London Communities stations
         env:
@@ -422,6 +429,40 @@ jobs:
           SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
         run: |
           python3 scripts/sensorcommunity/sensorcommunity_backfill_timeseries_phenomena.py
+
+      - name: Refresh WAQN references from OpenAir metadata
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+        run: |
+          python3 scripts/official_networks/openair_reference.py \
+            --connector-code waqn \
+            --skip-if-unconfigured
+
+      - name: Refresh SAQN references from OpenAir metadata
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+        run: |
+          python3 scripts/official_networks/openair_reference.py \
+            --connector-code saqn \
+            --skip-if-unconfigured
+
+      - name: Refresh Northern Ireland references from OpenAir metadata
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+        run: |
+          python3 scripts/official_networks/openair_reference.py \
+            --connector-code ni \
+            --skip-if-unconfigured
+
+      - name: Resolve canonical physical monitoring sites
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+        run: |
+          python3 scripts/official_networks/canonical_site_resolver.py
 
       - name: Refresh station PCON/LA from R2 shards
         env:
