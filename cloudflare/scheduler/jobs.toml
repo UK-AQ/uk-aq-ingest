@@ -55,7 +55,7 @@ notes = "Sensor.Community ingest trigger"
 
 [jobs.uk_aq_sos]
 enabled = true
-cron_expr = "* */6 * * *"
+cron_expr = "0 */6 * * *"
 target_type = "cloud_run"
 cloud_run_url_managed_by_deploy = true
 cloud_run_method = "POST"
@@ -64,7 +64,7 @@ notes = "UK-AIR SOS ingest trigger"
 
 [jobs.uk_aq_waqn]
 enabled = true
-cron_expr = "* */6 * * *"
+cron_expr = "0 */6 * * *"
 target_type = "cloud_run"
 cloud_run_url_managed_by_deploy = true
 cloud_run_method = "POST"
@@ -72,8 +72,8 @@ dry_run = false
 notes = "WAQN ingest trigger"
 
 [jobs.uk_aq_saqn]
-enabled = true
-cron_expr = "* */6 * * *"
+enabled = false
+cron_expr = "0 */6 * * *"
 target_type = "cloud_run"
 cloud_run_url_managed_by_deploy = true
 cloud_run_method = "POST"
@@ -81,8 +81,8 @@ dry_run = false
 notes = "SAQN ingest trigger"
 
 [jobs.uk_aq_ni]
-enabled = true
-cron_expr = "* */6 * * *"
+enabled = false
+cron_expr = "0 */6 * * *"
 target_type = "cloud_run"
 cloud_run_url_managed_by_deploy = true
 cloud_run_method = "POST"
