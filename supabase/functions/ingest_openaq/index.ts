@@ -1,3 +1,4 @@
+import { loadRetention, eligibleObservation, boundedStart, assertEligibleRows, sourceTimestamp } from "../_shared/retention.mjs";
 // trigger deploy 2026-02-09 12:36
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import "../_shared/fetch_egress_patch.ts";
@@ -15,6 +16,9 @@ import {
   writeIngestDbObservations,
 } from "../_shared/ingestdb_observation_writer.mjs";
 import { writeOpenAqIngestDbObservations } from "./ingestdb_observation_write.mjs";
+import { eligibleIngestTimestamp, ingestRetentionDays, ingestRetentionStart } from "../_shared/ingest_retention.ts";
+
+const INGEST_RETENTION_DAYS = ingestRetentionDays(Deno.env.get("INGESTDB_RETENTION_DAYS"));
 
 type PollRequest = {
   connector_code?: string;
@@ -1869,7 +1873,7 @@ async function listHourlyMeasurements(
     }
     const params: Record<string, string | number> = { limit, page };
     if (datetimeFrom) {
-      params.datetime_from = datetimeFrom;
+      params.datetime_from = boundedStart(datetimeFrom).toISOString();
     }
     if (datetimeTo) {
       params.datetime_to = datetimeTo;
@@ -1938,8 +1942,10 @@ function recordObservation(
   windowMs: number | null,
   stationIdByObservedRef?: Map<string, number>,
 ): void {
+  const normalized = sourceTimestamp(observedAt);
+  if (!normalized) return;
   const observedMs = Date.parse(observedAt);
-  if (!Number.isFinite(observedMs)) {
+  if (!Number.isFinite(observedMs) || !eligibleObservation(observedAt)) {
     return;
   }
   if (windowMs && observedMs < nowMs - windowMs) {
@@ -2113,9 +2119,7 @@ function resolveHourlyObservedAt(
   }
   const observedMs = Date.parse(observedAt);
   if (Number.isFinite(observedMs) && observedMs > nowMs) {
-    return periodFrom
-      ? String(periodFrom)
-      : String(new Date(nowMs).toISOString());
+    return null;
   }
   return String(observedAt);
 }
@@ -2534,6 +2538,7 @@ async function upsertObservations(
     requestBodyBytes: (chunk: Array<Record<string, unknown>>) =>
       serializedJsonUtf8Bytes(buildCompactObservationRpcArgs(chunk)),
     writeChunk: async (chunk: Array<Record<string, unknown>>) => {
+      assertEligibleRows(chunk);
       const { error } = await rpcRequest<
         Array<{ observations_upserted: number }>
       >(
@@ -2664,6 +2669,10 @@ serve(async (req) => {
   const authResponse = requireCronSecret(req);
   if (authResponse) {
     return authResponse;
+  }
+  try { await loadRetention("openaq"); } catch (error) {
+    console.error("Retention ownership lookup failed:", error);
+    return new Response("Internal server error.", { status: 500 });
   }
   if (!OPENAQ_API_KEY) {
     return jsonResponse({ error: "OPENAQ_API_KEY is required." }, 500);
@@ -3516,6 +3525,7 @@ serve(async (req) => {
           const tsObservedMs = Date.parse(tsCheckpoint.last_observed_at);
           if (
             Number.isFinite(tsObservedMs) &&
+            tsObservedMs <= nowMs &&
             nowMs - tsObservedMs < 60 * 60 * 1000
           ) {
             if (stationId === debugStationId) {
@@ -3532,19 +3542,11 @@ serve(async (req) => {
         if (typeof stationId === "number" && Number.isFinite(stationId)) {
           polledStationIds.add(stationId);
         }
-        const baseObservedAt = tsCheckpoint?.last_observed_at ??
-          stationCheckpoint?.last_observed_at ??
-          null;
-        const datetimeFrom = baseObservedAt ??
-          (windowMs ? new Date(nowMs - windowMs).toISOString() : null);
-        let datetimeTo = new Date(nowMs).toISOString();
-        if (datetimeFrom && windowMs) {
-          const fromMs = Date.parse(datetimeFrom);
-          if (Number.isFinite(fromMs)) {
-            const cappedMs = Math.min(nowMs, fromMs + windowMs);
-            datetimeTo = new Date(cappedMs).toISOString();
-          }
-        }
+        // A companion's old high-water mark cannot select historical acquisition.
+        // Replay a recent interval so late arrivals below any high-water mark survive.
+        const recentMs = Math.min(48 * 3600_000, Math.max(6 * 3600_000, windowMs || 0));
+        const datetimeFrom = boundedStart(new Date(nowMs - recentMs)).toISOString();
+        const datetimeTo = new Date(nowMs).toISOString();
         if (stationId === debugStationId) {
           logLine("INFO", "OpenAQ debug timeseries fetch", {
             station_id: stationId,
@@ -3645,7 +3647,7 @@ serve(async (req) => {
                 continue;
               }
               const observedAt = resolveHourlyObservedAt(record, nowMs);
-              if (!observedAt) {
+              if (!observedAt || !eligibleObservation(observedAt)) {
                 continue;
               }
               const observed = new Date(observedAt);
@@ -3776,7 +3778,7 @@ serve(async (req) => {
         value,
         stationId,
         nowMs,
-        windowMs,
+          null,
         stationIdByObservedTimeseriesRef,
       );
     }
@@ -3881,6 +3883,18 @@ serve(async (req) => {
   let observsWritten = 0;
   let observsReceiptsUpserted = 0;
   let observsEnqueued = 0;
+  latestByTimeseries.clear();
+  latestObservedByStationId.clear();
+  for (const [ref, observations] of observationsByTimeseries) {
+    for (const [at, value] of observations) {
+      if (!eligibleObservation(at)) { observations.delete(at); continue; }
+      const previous = latestByTimeseries.get(ref);
+      if (!previous || at >= previous.observed_at) latestByTimeseries.set(ref, { observed_at: at, value });
+      const station = stationIdByObservedTimeseriesRef.get(ref);
+      if (station != null && at > (latestObservedByStationId.get(station) ?? "")) latestObservedByStationId.set(station, at);
+    }
+    if (!observations.size) observationsByTimeseries.delete(ref);
+  }
   const seriesPolled = observationsByTimeseries.size;
   let lastObservedAt: string | null = null;
   let timeseriesLastUpdated = 0;
@@ -3959,7 +3973,7 @@ serve(async (req) => {
       try {
         const observsStats = await writeObservsWithOutbox(
           rpcRequest,
-          observsRows,
+          observsRows.filter((row) => eligibleObservation(row.observed_at)),
           (message) => {
             logLine("WARN", "OpenAQ observs write warning", {
               connector_id: connector.id,
@@ -3999,7 +4013,7 @@ serve(async (req) => {
       if (!timeseriesId) {
         continue;
       }
-      if (typeof latest.value !== "number") {
+      if (typeof latest.value !== "number" || !eligibleObservation(latest.observed_at)) {
         continue;
       }
       timeseriesUpdates.push({
@@ -4014,7 +4028,8 @@ serve(async (req) => {
     );
   }
 
-  for (const latest of latestByTimeseries.values()) {
+  for (const [ref, latest] of latestByTimeseries) {
+    if (!eligibleObservation(latest.observed_at)) { latestByTimeseries.delete(ref); continue; }
     if (!lastObservedAt || latest.observed_at > lastObservedAt) {
       lastObservedAt = latest.observed_at;
     }
@@ -4060,7 +4075,7 @@ serve(async (req) => {
           ? timeseriesCheckpointById[timeseriesId]?.last_observed_at ?? null
           : null;
         const candidate = latestObserved ?? checkpointObserved;
-        if (!candidate) {
+        if (!candidate || !eligibleObservation(candidate)) {
           continue;
         }
         if (!minObserved || candidate < minObserved) {
@@ -4071,7 +4086,7 @@ serve(async (req) => {
           const contigEnd = gapContigEndByTimeseriesRef.get(timeseriesRef) ??
             candidate;
           if (
-            contigEnd &&
+            contigEnd && eligibleObservation(contigEnd) &&
             (!recentGapMinObserved || contigEnd < recentGapMinObserved)
           ) {
             recentGapMinObserved = contigEnd;
@@ -4092,8 +4107,8 @@ serve(async (req) => {
       let lagSamples = checkpoint?.ingest_lag_samples ?? [];
       let updatedLastObserved = previousLastObserved;
       let nextDueAt = previousNextDue;
-      const latestObservedForScheduling =
-        latestObservedByStationId.get(stationId) ?? null;
+      const stationLatest = latestObservedByStationId.get(stationId);
+      const latestObservedForScheduling = stationLatest && eligibleObservation(stationLatest) ? stationLatest : null;
       const { minObserved, recentGapMinObserved } =
         resolveStationObservedForCheckpoint(stationId);
       const minObservedForStation = recentGapMinObserved ?? minObserved;
@@ -4108,7 +4123,7 @@ serve(async (req) => {
         });
       }
 
-      if (minObservedForStation) {
+      if (latestObservedForScheduling && minObservedForStation) {
         updatedLastObserved = minObservedForStation;
       }
       if (

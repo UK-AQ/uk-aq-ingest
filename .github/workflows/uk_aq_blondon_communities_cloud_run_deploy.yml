@@ -5,14 +5,17 @@ on:
     branches:
       - main
     paths:
+      - "supabase/functions/_shared/retention.mjs"
       - "workers/uk_aq_blondon_communities_cloud_run/**"
       - "supabase/functions/ingest_breathelondon/**"
+      - "shared/blondon_communities_reference.mjs"
       - "supabase/functions/_shared/cache.ts"
       - "supabase/functions/_shared/fetch_egress_patch.ts"
       - "supabase/functions/_shared/egress_metrics.ts"
       - "supabase/functions/_shared/service_egress_metrics.ts"
       - "supabase/functions/_shared/observs_client.ts"
       - "supabase/functions/_shared/ingestdb_observation_writer.mjs"
+      - "supabase/functions/_shared/ingest_retention.ts"
       - "scripts/gcp/**"
       - "scripts/cloudflare/uk_aq_reconcile_ingest_scheduler_url.sh"
       - ".github/workflows/uk_aq_blondon_communities_cloud_run_deploy.yml"
@@ -20,6 +23,7 @@ on:
 
 concurrency:
   group: uk-aq-ingest-cloud-run-shared-secret-deploy
+  queue: max
   cancel-in-progress: false
 
 jobs:
@@ -45,12 +49,13 @@ jobs:
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
       UK_AQ_CORE_SCHEMA: ${{ vars.UK_AQ_CORE_SCHEMA || 'uk_aq_core' }}
       UK_AQ_RAW_SCHEMA: ${{ vars.UK_AQ_RAW_SCHEMA || 'uk_aq_raw' }}
+      INGESTDB_RETENTION_DAYS: ${{ vars.INGESTDB_RETENTION_DAYS || '' }}
       OBS_AQIDB_RPC_SCHEMA: ${{ vars.OBS_AQIDB_RPC_SCHEMA || 'uk_aq_public' }}
       UK_AQ_SERVICE_EGRESS_METRICS_ENABLED: ${{ vars.UK_AQ_SERVICE_EGRESS_METRICS_ENABLED || 'false' }}
       UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL: ${{ vars.UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL || vars.OBS_AQIDB_SUPABASE_URL || '' }}
       UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA: ${{ vars.UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA || 'uk_aq_public' }}
       UK_AQ_SERVICE_EGRESS_METRICS_RPC: ${{ vars.UK_AQ_SERVICE_EGRESS_METRICS_RPC || 'uk_aq_rpc_service_egress_metrics_batch_upsert' }}
-      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || 'TEST' }}
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
       OBSERVS_WRITE_MODE: ${{ vars.BLONDON_COMMUNITIES_OBSERVS_WRITE_MODE || vars.OBSERVS_WRITE_MODE || 'pubsub_only' }}
       GCP_OBSERVS_PUBSUB_TOPIC: ${{ vars.GCP_OBSERVS_PUBSUB_TOPIC || 'uk-aq-observs-observations' }}
       OBSERVS_PUBSUB_PUBLISH_BATCH_SIZE: ${{ vars.OBSERVS_PUBSUB_PUBLISH_BATCH_SIZE || '500' }}
@@ -60,6 +65,7 @@ jobs:
       BLONDON_COMMUNITIES_SERVICE_LABEL: ${{ vars.BLONDON_COMMUNITIES_SERVICE_LABEL || 'Breathe London' }}
       BLONDON_COMMUNITIES_USER_AGENT: ${{ vars.BLONDON_COMMUNITIES_USER_AGENT || 'uk-air-quality-networks' }}
       BLONDON_COMMUNITIES_MAX_RUNTIME_SECONDS: ${{ vars.BLONDON_COMMUNITIES_MAX_RUNTIME_SECONDS || '300' }}
+      BLONDON_COMMUNITIES_INGESTDB_WRITE_TRANSPORT: ${{ vars.BLONDON_COMMUNITIES_INGESTDB_WRITE_TRANSPORT || 'postgrest' }}
       BLONDON_COMMUNITIES_IN_FLIGHT_TIMEOUT_MINUTES: ${{ vars.BLONDON_COMMUNITIES_IN_FLIGHT_TIMEOUT_MINUTES || '14' }}
       BLONDON_COMMUNITIES_CLAIM_TIMEOUT_MINUTES: ${{ vars.BLONDON_COMMUNITIES_CLAIM_TIMEOUT_MINUTES || '14' }}
       BLONDON_COMMUNITIES_RAW_DROPBOX_ALLOWED_SUPABASE_URL: ${{ vars.BLONDON_COMMUNITIES_RAW_DROPBOX_ALLOWED_SUPABASE_URL || '' }}
@@ -76,6 +82,7 @@ jobs:
       DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
       DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
       DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+      UK_AQ_GCP_CLOUD_RUN_DATABASE_URL: ${{ secrets.UK_AQ_GCP_CLOUD_RUN_DATABASE_URL }}
       SB_SECRET_KEY_SECRET_NAME: ${{ vars.SB_SECRET_KEY_SECRET_NAME || 'SB_SECRET_KEY' }}
       OBS_AQIDB_SECRET_KEY_SECRET_NAME: ${{ vars.OBS_AQIDB_SECRET_KEY_SECRET_NAME || 'OBS_AQIDB_SECRET_KEY' }}
       UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY_SECRET_NAME: ${{ vars.UK_AQ_SERVICE_EGRESS_METRICS_SB_SECRET_KEY_SECRET_NAME || vars.OBS_AQIDB_SECRET_KEY_SECRET_NAME || 'OBS_AQIDB_SECRET_KEY' }}
@@ -84,6 +91,7 @@ jobs:
       DROPBOX_APP_KEY_SECRET_NAME: ${{ vars.DROPBOX_APP_KEY_SECRET_NAME || 'DROPBOX_APP_KEY' }}
       DROPBOX_APP_SECRET_SECRET_NAME: ${{ vars.DROPBOX_APP_SECRET_SECRET_NAME || 'DROPBOX_APP_SECRET' }}
       DROPBOX_REFRESH_TOKEN_SECRET_NAME: ${{ vars.DROPBOX_REFRESH_TOKEN_SECRET_NAME || 'DROPBOX_REFRESH_TOKEN' }}
+      UK_AQ_GCP_CLOUD_RUN_DATABASE_URL_SECRET_NAME: ${{ vars.UK_AQ_GCP_CLOUD_RUN_DATABASE_URL_SECRET_NAME || 'UK_AQ_GCP_CLOUD_RUN_DATABASE_URL' }}
       GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
       GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
       GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -92,8 +100,19 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       SCHEDULER_D1_JOB_KEY: uk_aq_blondon_communities
     steps:
+      - name: Validate normal ingestion retention
+        run: |
+          python3 - <<'PYCODE'
+          import os, re
+          value = os.environ.get("INGESTDB_RETENTION_DAYS", "")
+          if not re.fullmatch(r"[0-9]+", value) or int(value) < 2:
+              raise SystemExit("INGESTDB_RETENTION_DAYS must match Prune and be an integer >= 2")
+          runtime = min(600, max(30, int(os.environ["BLONDON_COMMUNITIES_MAX_RUNTIME_SECONDS"])))
+          if int(os.environ["SERVICE_TIMEOUT_SECONDS"]) < runtime + 180:
+              raise SystemExit("Communities service timeout must leave 180 seconds of cleanup headroom")
+          PYCODE
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Validate required project config
         run: |
@@ -114,10 +133,38 @@ jobs:
             echo "Missing required secret: SUPABASE_URL"
             exit 1
           fi
+          if [ -z "${UK_AQ_ENV_NAME:-}" ]; then
+            echo "Missing required GitHub Actions repository variable: UK_AQ_ENV_NAME"
+            exit 1
+          fi
+          case "${UK_AQ_ENV_NAME}" in
+            TEST|LIVE) ;;
+            *)
+              echo "UK_AQ_ENV_NAME must be exactly TEST or LIVE."
+              exit 1
+              ;;
+          esac
           if [ "${BLONDON_COMMUNITIES_CONNECTOR_CODE}" != "blondon_communities" ]; then
             echo "Use connector_code=blondon_communities for Breathe London Communities. network_code/service_ref may remain breathelondon."
             exit 1
           fi
+          case "${BLONDON_COMMUNITIES_INGESTDB_WRITE_TRANSPORT}" in
+            postgrest) ;;
+            database)
+              if [ -z "${UK_AQ_GCP_CLOUD_RUN_DATABASE_URL:-}" ]; then
+                echo "BLONDON_COMMUNITIES_INGESTDB_WRITE_TRANSPORT=database requires UK_AQ_GCP_CLOUD_RUN_DATABASE_URL."
+                exit 1
+              fi
+              if [ -z "${UK_AQ_GCP_CLOUD_RUN_DATABASE_URL_SECRET_NAME:-}" ]; then
+                echo "BLONDON_COMMUNITIES_INGESTDB_WRITE_TRANSPORT=database requires UK_AQ_GCP_CLOUD_RUN_DATABASE_URL_SECRET_NAME."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "BLONDON_COMMUNITIES_INGESTDB_WRITE_TRANSPORT must be exactly postgrest or database."
+              exit 1
+              ;;
+          esac
           observs_mode="$(printf '%s' "${OBSERVS_WRITE_MODE:-}" | tr '[:upper:]' '[:lower:]')"
           if [ "${observs_mode}" = "pubsub_only" ] && [ -z "${GCP_OBSERVS_PUBSUB_TOPIC:-}" ]; then
             echo "OBSERVS_WRITE_MODE=pubsub_only requires GCP_OBSERVS_PUBSUB_TOPIC."
@@ -162,19 +209,19 @@ jobs:
 
       - name: Authenticate to Google Cloud (WIF)
         if: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && env.GCP_SERVICE_ACCOUNT != '' }}
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
         with:
           workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
 
       - name: Authenticate to Google Cloud (Service Account Key fallback)
         if: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER == '' || env.GCP_SERVICE_ACCOUNT == '' }}
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
         with:
           credentials_json: ${{ env.GCP_SA_KEY }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
 
       - name: Configure gcloud project
         run: |
@@ -255,6 +302,11 @@ jobs:
           upsert_secret "UK_AQ_EDGE_UPSTREAM_SECRET" "${UK_AQ_EDGE_UPSTREAM_SECRET}" 1
           upsert_secret "${BLONDON_COMMUNITIES_API_KEY_SECRET_NAME}" "${BLONDON_COMMUNITIES_API_KEY}" 1
           upsert_secret "${SB_UK_AQ_CRON_SECRET_SECRET_NAME}" "${SB_UK_AQ_CRON_SECRET}" 0
+          if [ "${BLONDON_COMMUNITIES_INGESTDB_WRITE_TRANSPORT}" = "database" ]; then
+            upsert_secret "${UK_AQ_GCP_CLOUD_RUN_DATABASE_URL_SECRET_NAME}" "${UK_AQ_GCP_CLOUD_RUN_DATABASE_URL}" 1
+          else
+            echo "Skipping shared database secret sync (BLONDON_COMMUNITIES_INGESTDB_WRITE_TRANSPORT=${BLONDON_COMMUNITIES_INGESTDB_WRITE_TRANSPORT})."
+          fi
           observs_mode="$(printf '%s' "${OBSERVS_WRITE_MODE:-}" | tr '[:upper:]' '[:lower:]')"
           if [ "${observs_mode}" = "direct" ]; then
             upsert_secret "${OBS_AQIDB_SECRET_KEY_SECRET_NAME}" "${OBS_AQIDB_SECRET_KEY}" 1
@@ -321,11 +373,12 @@ jobs:
           add_env SUPABASE_URL
           add_env UK_AQ_CORE_SCHEMA
           add_env UK_AQ_RAW_SCHEMA
+          add_env INGESTDB_RETENTION_DAYS
           add_env UK_AQ_SERVICE_EGRESS_METRICS_ENABLED
           add_env UK_AQ_SERVICE_EGRESS_METRICS_SUPABASE_URL
           add_env UK_AQ_SERVICE_EGRESS_METRICS_SCHEMA
           add_env UK_AQ_SERVICE_EGRESS_METRICS_RPC
-          add_env UKAQ_ENV_NAME
+          add_env UK_AQ_ENV_NAME
           add_env OBSERVS_WRITE_MODE
           add_env GCP_OBSERVS_PUBSUB_TOPIC
           add_env OBSERVS_PUBSUB_PUBLISH_BATCH_SIZE
@@ -335,6 +388,7 @@ jobs:
           add_env BLONDON_COMMUNITIES_SERVICE_LABEL
           add_env BLONDON_COMMUNITIES_USER_AGENT
           add_env BLONDON_COMMUNITIES_MAX_RUNTIME_SECONDS
+          add_env BLONDON_COMMUNITIES_INGESTDB_WRITE_TRANSPORT
           add_env BLONDON_COMMUNITIES_IN_FLIGHT_TIMEOUT_MINUTES
           add_env BLONDON_COMMUNITIES_CLAIM_TIMEOUT_MINUTES
           add_env BLONDON_COMMUNITIES_RAW_DROPBOX_ALLOWED_SUPABASE_URL
@@ -356,6 +410,11 @@ jobs:
           add_secret_binding "UK_AQ_EDGE_UPSTREAM_SECRET" "UK_AQ_EDGE_UPSTREAM_SECRET" 1
           add_secret_binding "SB_SECRET_KEY" "${SB_SECRET_KEY_SECRET_NAME}" 1
           add_secret_binding "BLONDON_COMMUNITIES_API_KEY" "${BLONDON_COMMUNITIES_API_KEY_SECRET_NAME}" 1
+          if [ "${BLONDON_COMMUNITIES_INGESTDB_WRITE_TRANSPORT}" = "database" ]; then
+            add_secret_binding "UK_AQ_GCP_CLOUD_RUN_DATABASE_URL" "${UK_AQ_GCP_CLOUD_RUN_DATABASE_URL_SECRET_NAME}" 1
+          else
+            echo "Skipping shared database secret binding (BLONDON_COMMUNITIES_INGESTDB_WRITE_TRANSPORT=${BLONDON_COMMUNITIES_INGESTDB_WRITE_TRANSPORT})."
+          fi
           if [ -n "${SB_UK_AQ_CRON_SECRET:-}" ]; then
             add_secret_binding "SB_UK_AQ_CRON_SECRET" "${SB_UK_AQ_CRON_SECRET_SECRET_NAME}" 0
           fi

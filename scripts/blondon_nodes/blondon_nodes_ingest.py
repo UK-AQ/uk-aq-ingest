@@ -27,7 +27,9 @@ if PROJECT_ROOT.name == "scripts":
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.uk_aq_retention import load_retention, eligible_observation, bounded_start, assert_eligible_rows
 from scripts.uk_aq_supabase import SupabaseSchemas, create_supabase_client
+from scripts.uk_aq_retention import eligible_timestamp, retention_days, retention_start
 from scripts.uk_aq_service_egress_metrics import (
     configure_service_egress_metrics,
     flush_service_egress_metrics,
@@ -42,6 +44,7 @@ from scripts.blondon_nodes.blondon_nodes_reference_data import (
     upsert_nodes_phenomena,
 )
 from scripts.blondon_nodes.blondon_nodes_raw_capture import NodesRawCapture
+from scripts.blondon_nodes.blondon_nodes_recovery import run_recent_recovery
 from scripts.uk_aq_ingestdb_observation_writer import (
     DEFAULT_POSTGREST_ATTEMPT_RUNTIME_MS,
     IngestDbObservationWriteError,
@@ -61,7 +64,9 @@ logging.getLogger("postgrest").setLevel(getattr(logging, DEFAULT_LOG_LEVEL, logg
 
 CONNECTOR_CODE = "blondon_nodes"
 SERVICE_REF = os.getenv("BLONDON_NODES_SERVICE_REF", "breathelondon")
-BASE_URL = os.getenv("BLONDON_NODES_BASE_URL", "https://breathe-london-7x54d7qf.ew.gateway.dev").rstrip("/")
+# Provider-owned upstream shared by TEST and LIVE, independent of our deployed
+# service URLs. Change this invariant here if Breathe London moves its API.
+SHARED_BLONDON_NODES_API_BASE_URL = "https://breathe-london-7x54d7qf.ew.gateway.dev"
 DEFAULT_BATCH_SIZE = 500
 DEFAULT_OVERLAP_MINUTES = 10
 DEFAULT_SLEEP_SECONDS = 0.1
@@ -105,7 +110,7 @@ def utcnow() -> datetime:
 
 
 def parse_iso(value: Optional[str]) -> Optional[datetime]:
-    if not value:
+    if not isinstance(value, str) or not value.strip():
         return None
     text = value.strip().replace("Z", "+00:00")
     try:
@@ -150,19 +155,26 @@ class BreatheLondonNodesClient:
     def __init__(
         self,
         api_key: str,
-        base_url: str = BASE_URL,
-        timeout: int = 60,
+        base_url: str = SHARED_BLONDON_NODES_API_BASE_URL,
+        timeout: int | tuple[float, float] = 60,
         retries: int = 3,
         raw_capture: Optional[NodesRawCapture] = None,
+        strict_single_attempt: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        if not self.base_url:
+            raise RuntimeError("Nodes API base URL must not be empty.")
         self.timeout = timeout
         self.retries = retries
         self.raw_capture = raw_capture
+        self.strict_single_attempt = strict_single_attempt
         self.session = requests.Session()
         self.session.headers.update({"X-API-KEY": api_key, "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "uk-air-quality-networks"})
 
     def sensor_data(self, site_code: str, species: str, start_time: datetime, end_time: datetime) -> List[Dict[str, Any]]:
+        start_time = bounded_start(start_time)
+        if start_time >= end_time:
+            return []
         params = {"SiteCode": site_code, "Species": species, "startTime": iso_z(start_time), "endTime": iso_z(end_time)}
         raw_params = {
             "SiteCode": site_code,
@@ -173,8 +185,13 @@ class BreatheLondonNodesClient:
         url = f"{self.base_url}/SensorData"
         for attempt in range(1, self.retries + 1):
             try:
-                resp = self.session.get(url, params=params, timeout=self.timeout)
+                resp = self.session.get(
+                    url, params=params, timeout=self.timeout,
+                    allow_redirects=not self.strict_single_attempt,
+                )
                 if resp.status_code in (429, 500, 502, 503, 504):
+                    if self.strict_single_attempt:
+                        resp.raise_for_status()
                     time.sleep(min(30, 2 ** attempt)); continue
                 resp.raise_for_status()
                 payload = resp.json()
@@ -208,7 +225,9 @@ class BreatheLondonNodesClient:
 class PubSubPublisher:
     def __init__(self) -> None:
         self.project_id = (os.getenv("GCP_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT") or "").strip()
-        self.observs_topic = (os.getenv("GCP_OBSERVS_PUBSUB_TOPIC") or "uk-aq-observs-observations").strip()
+        self.observs_topic = (os.getenv("GCP_OBSERVS_PUBSUB_TOPIC") or "").strip()
+        if not self.observs_topic:
+            raise RuntimeError("GCP_OBSERVS_PUBSUB_TOPIC is required for Pub/Sub delivery.")
         self.batch_size = int(os.getenv("OBSERVS_PUBSUB_PUBLISH_BATCH_SIZE") or "500")
 
     def _topic_path(self, topic: str) -> str:
@@ -454,6 +473,7 @@ class SupabaseWriter:
         ]
 
         def write_chunk(chunk: Sequence[Dict[str, Any]]) -> None:
+            assert_eligible_rows(chunk)
             arguments = build_compact_observation_rpc_args(chunk)
             if self.observation_database is not None:
                 self.observation_database.upsert_compact_observations_v1(arguments)
@@ -484,6 +504,7 @@ class SupabaseWriter:
         return int(stats["committed_rows"])
 
     def update_timeseries_value_bounds(self, rows: Sequence[Dict[str, Any]]) -> int:
+        rows = [r for r in rows if eligible_observation(r["observed_at"])]
         grouped: Dict[int, List[Dict[str, Any]]] = {}
         for row in rows:
             grouped.setdefault(int(row["timeseries_id"]), []).append(dict(row))
@@ -584,7 +605,7 @@ def write_secondary_rows(
         return stats
     for rows_chunk in rows_chunks:
         try:
-            chunk_stats = observs_writer.write(rows_chunk)
+            chunk_stats = observs_writer.write([r for r in rows_chunk if eligible_observation(r["observed_at"])])
             stats["written"] += chunk_stats["written"]
             stats["enqueued"] += chunk_stats["enqueued"]
             stats["pubsub_observs"] += chunk_stats["pubsub_observs"]
@@ -664,7 +685,7 @@ def build_rows(
         if value is None:
             nulls += 1; continue
         observed = parse_iso(entry.get("DateTime"))
-        if observed is None:
+        if observed is None or not eligible_observation(observed):
             continue
         meta = {k: entry.get(k) for k in ("Units", "RatificationStatus", "Source", "Duration", "SensorContract") if entry.get(k) is not None}
         status = entry.get("RatificationStatus")
@@ -679,7 +700,7 @@ def build_rows(
     last_value: Optional[float] = None
     for row in rows:
         observed = parse_iso(row["observed_at"])
-        if observed is None:
+        if observed is None or not eligible_observation(observed):
             continue
         if last_at is None or observed > last_at:
             last_at = observed
@@ -769,6 +790,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_ingest(args: argparse.Namespace, raw_capture: NodesRawCapture) -> int:
+    load_retention("blondon_nodes")
+    run_started = time.monotonic()
+    days = retention_days()
     species = parse_species(args.species)
     if not species:
         raise SystemExit("No valid species selected.")
@@ -778,6 +802,18 @@ def run_ingest(args: argparse.Namespace, raw_capture: NodesRawCapture) -> int:
     writer = SupabaseWriter()
     connector = writer.fetch_connector()
     connector_id = int(connector["id"])
+
+    def recent_recovery(skip_reason: Optional[str] = None) -> Dict[str, Any]:
+        if args.dry_run or any((args.site_code, args.start_time, args.end_time,
+                                args.species, args.max_stations, args.max_api_calls)):
+            skip_reason = "manual_or_dry_run"
+        return run_recent_recovery(
+            writer=writer, api_key=api_key, raw_capture=raw_capture,
+            client_factory=BreatheLondonNodesClient, build_rows=build_rows,
+            observs_factory=ObservsWriter, run_started=run_started,
+            skip_reason=skip_reason,
+        )
+
     if connector.get("poll_enabled") is False and not (args.start_time or args.site_code):
         LOG.info("Connector blondon_nodes poll_enabled=false; exiting normal scheduled run.")
         raw_capture.finalize_safely()
@@ -816,6 +852,7 @@ def run_ingest(args: argparse.Namespace, raw_capture: NodesRawCapture) -> int:
                 "partial": False,
                 "stopped_reason": "poll_disabled",
                 "dry_run": args.dry_run,
+                "recovery": recent_recovery("poll_disabled"),
                 **raw_capture.summary_fields(),
             }
         )
@@ -838,6 +875,7 @@ def run_ingest(args: argparse.Namespace, raw_capture: NodesRawCapture) -> int:
         len(all_stations),
     )
     if not stations:
+        recovery = recent_recovery()
         raw_capture.finalize_safely()
         emit_run_summary(
             {
@@ -874,6 +912,7 @@ def run_ingest(args: argparse.Namespace, raw_capture: NodesRawCapture) -> int:
                 "partial": False,
                 "stopped_reason": "no_due_stations",
                 "dry_run": args.dry_run,
+                "recovery": recovery,
                 **raw_capture.summary_fields(),
             }
         )
@@ -914,12 +953,21 @@ def run_ingest(args: argparse.Namespace, raw_capture: NodesRawCapture) -> int:
         secondary_error_count += 1
         secondary_errors.append(f"observs_writer_init: {exc}")
         LOG.warning("Secondary Observs writer initialization failed: %s", exc)
-    end_time = floor_to_minute(parse_iso(args.end_time) or utcnow())
+    if args.end_time and parse_iso(args.end_time) is None:
+        raise ValueError("Invalid --end-time")
+    if args.start_time and parse_iso(args.start_time) is None:
+        raise ValueError("Invalid --start-time")
+    end_time = floor_to_minute(min(parse_iso(args.end_time) or utcnow(), utcnow()))
     poll_hours = float(connector.get("poll_window_hours") or 6)
-    default_start = floor_to_minute(utcnow()) - timedelta(
+    earliest = retention_start(utcnow(), days)
+    if end_time <= earliest:
+        raise ValueError("Requested Nodes end time is outside IngestDB retention")
+    default_start = max(earliest, floor_to_minute(utcnow()) - timedelta(
         hours=max(poll_hours, 0.1)
-    )
+    ))
     explicit_start = parse_iso(args.start_time)
+    if args.start_time and explicit_start is None:
+        raise ValueError("Invalid --start-time")
     raw_capture.record_context(
         {
             "connector_code": CONNECTOR_CODE,
@@ -976,7 +1024,9 @@ def run_ingest(args: argparse.Namespace, raw_capture: NodesRawCapture) -> int:
                 ),
                 default_start,
             )
-            start_time = floor_to_minute(start_time)
+            start_time = bounded_start(floor_to_minute(start_time))
+            if start_time >= end_time:
+                continue
             last_at = None
             last_value = None
             try:
@@ -998,6 +1048,15 @@ def run_ingest(args: argparse.Namespace, raw_capture: NodesRawCapture) -> int:
                     station_ref,
                     sp,
                 )
+                rows = [row for row in rows if eligible_timestamp(
+                    parse_iso(row["observed_at"]), utcnow(), days
+                )]
+                if rows:
+                    newest = max(rows, key=lambda row: row["observed_at"])
+                    last_at = newest["observed_at"]
+                    last_value = newest["value"]
+                else:
+                    last_at = last_value = None
                 null_values_skipped += nulls
                 source_duplicate_rows_deduplicated += duplicate_rows_deduplicated
                 source_conflicting_duplicate_timestamps += conflicting_duplicate_timestamps
@@ -1007,19 +1066,21 @@ def run_ingest(args: argparse.Namespace, raw_capture: NodesRawCapture) -> int:
                         rows[index:index + args.batch_size]
                         for index in range(0, len(rows), args.batch_size)
                     ]
+                    committed_chunks = []
                     for rows_chunk in rows_chunks:
+                        assert_eligible_rows(rows_chunk)
                         writer.upsert_observations(rows_chunk)
                         observations_upserted += len(rows_chunk)
                         written_observation_rows.extend(rows_chunk)
-                    if last_at and last_value is not None:
+                    if last_at and eligible_observation(last_at) and last_value is not None:
                         species_last_observed[sp] = last_at
                         parsed_last_at = parse_iso(last_at)
                         if parsed_last_at:
                             successful_last_observed.append(parsed_last_at)
-                    observs_rows_prepared += len(rows)
+                    observs_rows_prepared += sum(len(chunk) for chunk in committed_chunks)
                     observs_stats = write_secondary_rows(
                         observs_writer,
-                        rows_chunks,
+                        committed_chunks,
                         station_ref,
                         sp,
                     )
@@ -1045,6 +1106,7 @@ def run_ingest(args: argparse.Namespace, raw_capture: NodesRawCapture) -> int:
                 time.sleep(args.sleep_seconds)
 
         previous_last_observed = parse_iso(checkpoint.get("last_observed_at"))
+        successful_last_observed = [at for at in successful_last_observed if eligible_observation(at)]
         latest_success = max(successful_last_observed) if successful_last_observed else None
         station_last_observed = max(
             [value for value in (previous_last_observed, latest_success) if value is not None],
@@ -1118,6 +1180,7 @@ def run_ingest(args: argparse.Namespace, raw_capture: NodesRawCapture) -> int:
     secondary_error_message = (
         "; ".join(secondary_errors)[:4000] if secondary_errors else None
     )
+    recovery = recent_recovery("normal_ingest_incomplete" if partial else None)
     raw_capture.finalize_safely()
     summary = {
         "ok": True,
@@ -1160,6 +1223,7 @@ def run_ingest(args: argparse.Namespace, raw_capture: NodesRawCapture) -> int:
         "reference_repair_errors": writer.reference_repair_errors[:100],
         "stopped_reason": stopped_reason,
         "dry_run": args.dry_run,
+        "recovery": recovery,
         **raw_capture.summary_fields(),
     }
     LOG.info(

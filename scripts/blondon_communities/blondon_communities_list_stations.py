@@ -37,6 +37,10 @@ from scripts.uk_aq_supabase import (
     retry_supabase_operation,
 )
 from scripts.uk_aq_phenomena_rpc import upsert_phenomena_via_rpc
+from scripts.uk_aq_ingestdb_observation_writer import (
+    build_compact_observation_rpc_args,
+    write_observations,
+)
 
 load_dotenv()
 
@@ -172,11 +176,13 @@ class BreatheLondonClient:
         base_url: str = BLONDON_COMMUNITIES_BASE_URL,
         timeout: int = 60,
         retries: int = 3,
+        raise_on_retry_exhaustion: bool = False,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url
         self.timeout = timeout
         self.retries = retries
+        self.raise_on_retry_exhaustion = raise_on_retry_exhaustion
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": BLONDON_COMMUNITIES_USER_AGENT})
 
@@ -198,6 +204,8 @@ class BreatheLondonClient:
                 if attempt == self.retries:
                     raise
                 self._sleep(attempt)
+        if self.raise_on_retry_exhaustion:
+            raise RuntimeError("Breathe London request retries exhausted")
         return []
 
     def _sleep(self, attempt: int) -> None:
@@ -633,24 +641,38 @@ class SupabaseWriter:
         ).execute()
         return len(payload)
 
+    def upsert_observations(self, rows: Iterable[Dict[str, Any]]) -> int:
+        payload = list(rows)
+        if not payload:
+            return 0
+        stats = write_observations(
+            payload,
+            chunk_size=len(payload),
+            connector_code="blondon_communities",
+            write_chunk=lambda chunk: self.public.rpc(
+                "uk_aq_rpc_observations_compact_upsert_v1",
+                build_compact_observation_rpc_args(chunk),
+            ).execute(),
+            logger=LOG,
+        )
+        return int(stats["committed_rows"])
+
     def update_timeseries_last_values(
         self, rows: Iterable[Dict[str, Any]]
     ) -> int:
         payload = [row for row in rows if row.get("id")]
         if not payload:
             return 0
-        updated = 0
-        for row in payload:
-            update_payload = {}
-            if "last_value" in row:
-                update_payload["last_value"] = row["last_value"]
-            if "last_value_at" in row:
-                update_payload["last_value_at"] = row["last_value_at"]
-            if not update_payload:
-                continue
-            self.core.table("timeseries").update(update_payload).eq("id", row["id"]).execute()
-            updated += 1
-        return updated
+        response = self.public.rpc(
+            "uk_aq_rpc_timeseries_last_values_compact_update_v1",
+            {
+                "timeseries_ids": [row["id"] for row in payload],
+                "last_values": [row["last_value"] for row in payload],
+                "last_value_ats": [row["last_value_at"] for row in payload],
+            },
+        ).execute()
+        data = response.data if hasattr(response, "data") else response.get("data")
+        return int(data[0]["timeseries_updated"]) if data else 0
 
 
 def chunked(values: List[str], size: int) -> Iterable[List[str]]:

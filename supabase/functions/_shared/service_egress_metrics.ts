@@ -97,6 +97,7 @@ function defaultQueryName(method: string, routePath: string): string {
       uk_aq_rpc_phenomena_ids: "lookup_phenomena_ids",
       uk_aq_rpc_phenomena_upsert: "upsert_phenomena",
       uk_aq_rpc_observations_compact_upsert_v1: "compact_observation_upsert",
+      uk_aq_rpc_observations_compact_upsert_v2: "compact_observation_upsert",
       uk_aq_rpc_observs_observations_compact_upsert_v1:
         "compact_observation_upsert",
       uk_aq_rpc_observs_outbox_enqueue: "enqueue_observs",
@@ -145,7 +146,7 @@ class ServiceEgressMetricsCollector {
       Deno.env.get("UK_AQ_SERVICE_EGRESS_METRICS_ENABLED"),
       false,
     );
-    this.envName = (Deno.env.get("UKAQ_ENV_NAME") || "TEST").trim();
+    this.envName = (Deno.env.get("UK_AQ_ENV_NAME") || "TEST").trim();
   }
 
   private warn(message: string, details: Record<string, unknown> = {}): void {
